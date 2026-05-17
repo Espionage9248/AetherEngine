@@ -16,17 +16,15 @@ final class AVIOReader: @unchecked Sendable {
 
     private let url: URL
     private let extraHeaders: [String: String]
-    /// Shared config blueprint. Each `fetchChunk` builds a fresh
-    /// ephemeral `URLSession` from this config and invalidates it
-    /// after its single request returns. That release pattern is the
-    /// fix for the 3 MB/sec leak: URLSession keeps response data
-    /// alive in its internal completed-task pool until the session
-    /// itself is invalidated, so a long-lived session over many
-    /// chunk fetches steadily accumulates 1 MB per completed task
-    /// (sized to our `chunkSize`). Per-request session brings that
-    /// to zero. The streaming download path already uses this
-    /// pattern (see `streamDownloadSync`).
-    private let sessionConfig: URLSessionConfiguration
+    /// Long-lived ephemeral session, shared by all Range fetches for
+    /// the lifetime of this reader. The session has `urlCache = nil`
+    /// so that `dispatch_data_t` response bodies aren't retained in
+    /// an in-memory URLCache after each completion. With ephemeral +
+    /// reloadIgnoringLocalAndRemoteCacheData + nil cache, the only
+    /// remaining 8 MB Data alive per fetch is whatever our completion
+    /// handler returns to `fetchChunk`, and ARC releases it as soon
+    /// as `currentBuffer`/`prefetchBuffer` is reassigned.
+    private let session: URLSession
     private var position: Int64 = 0
     private var fileSize: Int64 = -1
 
@@ -67,8 +65,14 @@ final class AVIOReader: @unchecked Sendable {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForResource = 60
         config.httpMaximumConnectionsPerHost = 2
-        config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        self.sessionConfig = config
+        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        // Disable the in-memory URLCache entirely. Ephemeral only
+        // turns off the on-disk cache; without this line every fetch
+        // still leaves an 8 MB entry parked in an NSURLStorageURLCacheDB
+        // until the session is invalidated (Instruments traced the
+        // 4K HDR leak to this exact path).
+        config.urlCache = nil
+        self.session = URLSession(configuration: config)
     }
 
     /// Apply the caller-supplied extra headers to a request. Used by
@@ -156,9 +160,10 @@ final class AVIOReader: @unchecked Sendable {
         streamLock.unlock()
         streamDataReady.signal()
 
-        // Per-request URLSessions are invalidated in syncRequest itself,
-        // so there's no long-lived session here to clean up. Streaming
-        // mode owns its own URLSession lifecycle inside streamDownloadSync.
+        // Tear down the long-lived Range-fetch session. Streaming
+        // mode owns its own URLSession lifecycle inside
+        // streamDownloadSync, so it's not touched here.
+        session.invalidateAndCancel()
     }
 
     // MARK: - Read (called by FFmpeg on demux thread)
@@ -484,15 +489,6 @@ final class AVIOReader: @unchecked Sendable {
         let semaphore = DispatchSemaphore(value: 0)
         nonisolated(unsafe) var result: (Data, URLResponse)?
         nonisolated(unsafe) var error: Error?
-
-        // Fresh URLSession per request so its task pool can be released
-        // immediately via finishTasksAndInvalidate() once we're done.
-        // Reusing a long-lived session leaks ~chunkSize bytes per
-        // completed task into URLSession's internal completed-task
-        // cache, scaling to ~3 MB/sec on 25 Mbps content over a 15 min
-        // session.
-        let session = URLSession(configuration: sessionConfig)
-        defer { session.finishTasksAndInvalidate() }
 
         let task = session.dataTask(with: request) { d, r, e in
             if let e = e {
