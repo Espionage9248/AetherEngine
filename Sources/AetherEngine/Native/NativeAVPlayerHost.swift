@@ -53,6 +53,15 @@ final class NativeAVPlayerHost {
     /// (audio-track switch, background reopen) so the system Now Playing
     /// surface keeps its title / artwork after the seam.
     private var pendingExternalMetadata: [AVMetadataItem] = []
+    /// URL passed to the most recent `load(url:startPosition:perFrameHDR:)`
+    /// invocation. Stored so the leak-reset POC can rebuild the
+    /// AVPlayerItem against the same loopback HLS endpoint without
+    /// having to teardown HLSVideoEngine.
+    private(set) var lastLoadedURL: URL?
+    /// `perFrameHDR` flag from the most recent load. Replayed on POC
+    /// reload so the AVPlayerItem's HDR pipeline configuration matches
+    /// the original session.
+    private(set) var lastPerFrameHDR: Bool = true
     private var timeObserver: Any?
     private var statusObservation: NSKeyValueObservation?
     private var rateObservation: NSKeyValueObservation?
@@ -97,6 +106,9 @@ final class NativeAVPlayerHost {
     /// right target mode before the first segment is fetched.
     func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true) {
         unloadCurrentItem()
+
+        self.lastLoadedURL = url
+        self.lastPerFrameHDR = perFrameHDR
 
         Self.nextSessionID += 1
         sessionID = Self.nextSessionID
@@ -366,6 +378,40 @@ final class NativeAVPlayerHost {
     /// `stopInternal()` after invoking `tearDown()` here).
     func tearDown() {
         unloadCurrentItem()
+    }
+
+    /// DIAGNOSTIC: rebuild the AVPlayerItem against the same loopback
+    /// HLS URL, restoring the current play position. Purpose is the
+    /// memory-reset POC — we want to know whether AVPlayer actually
+    /// releases its accumulated state (HEVC reference pool, IOSurface
+    /// pool, AVMediaSelectionOption display-name cache, internal
+    /// HLS-fMP4 demuxer state) when the AVPlayerItem is replaced.
+    ///
+    /// If the RSS drops measurably across this call: the seamless
+    /// AVQueuePlayer-chunked path is worth pursuing (item transitions
+    /// would have the same effect, just without a visible stutter).
+    /// If RSS doesn't budge: AVPlayer holds state at the player
+    /// level, not the item level, and the whole approach is dead.
+    ///
+    /// Returns the captured play position so the engine memprobe can
+    /// log it alongside the RSS readings. Returns nil if there's no
+    /// current load to rebuild.
+    func reloadCurrentItem() -> Double? {
+        guard let url = lastLoadedURL else { return nil }
+        let position = currentTime
+        EngineLog.emit(
+            "[NativeAVPlayerHost] POC reload: replacing AVPlayerItem against same URL "
+            + "(position=\(String(format: "%.2f", position))s, perFrameHDR=\(lastPerFrameHDR))",
+            category: .engine
+        )
+        load(url: url, startPosition: position, perFrameHDR: lastPerFrameHDR)
+        // Resume play immediately so the user doesn't end up paused
+        // after the reload (load() leaves rate at whatever the AVPlayer
+        // was at; if it was playing, it should re-start automatically
+        // once the new item reaches readyToPlay, but a play() call here
+        // is belt-and-suspenders).
+        avPlayer.play()
+        return position
     }
 
     // MARK: - Playback control

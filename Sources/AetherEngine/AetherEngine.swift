@@ -246,6 +246,20 @@ public final class AetherEngine: ObservableObject {
     /// `EngineLog.handler` so the host's diagnostic overlay sees it too.
     private var memoryProbeTask: Task<Void, Never>?
 
+    /// DIAGNOSTIC POC: how often the memprobe should trigger an
+    /// AVPlayerItem reload. Zero disables the POC (production
+    /// behaviour). Non-zero triggers `nativeHost.reloadCurrentItem()`
+    /// every `N` seconds during playback so we can measure whether
+    /// AVPlayer actually releases its accumulated state on item
+    /// replacement. Set on the native path only — software path is
+    /// untouched.
+    private static let DIAG_RELOAD_INTERVAL_SEC: TimeInterval = 300
+
+    /// Wall-clock timestamp of the last POC reload, or nil if no reload
+    /// has fired yet this session. Compared against the memprobe tick
+    /// to decide when to trigger the next reload.
+    private var lastReloadAt: Date?
+
     /// The URL of the current playback session. Used by
     /// `reloadAtCurrentPosition()` to rebuild the pipeline after
     /// background suspension.
@@ -1429,6 +1443,7 @@ public final class AetherEngine: ObservableObject {
         // leak the panel mode into the next playback.
         memoryProbeTask?.cancel()
         memoryProbeTask = nil
+        lastReloadAt = nil
         nativeCancellables.removeAll()
         nativeHost?.tearDown()
         nativeHost = nil
@@ -1539,6 +1554,40 @@ public final class AetherEngine: ObservableObject {
                 // One line per 30 s is cheap; the rest of EngineLog stays
                 // single-sink to avoid console spam.
                 print(line)
+
+                // DIAGNOSTIC POC: trigger AVPlayerItem reload if enough
+                // time has passed since the last one (or since session
+                // start). Measures whether AVPlayer's item replacement
+                // actually releases accumulated state.
+                if Self.DIAG_RELOAD_INTERVAL_SEC > 0,
+                   let host = self.nativeHost {
+                    let referenceTime = self.lastReloadAt ?? sessionStart
+                    let sinceLastReload = Date().timeIntervalSince(referenceTime)
+                    if sinceLastReload >= Self.DIAG_RELOAD_INTERVAL_SEC {
+                        let rssBefore = Self.residentMemoryMB()
+                        let reloadStart = DispatchTime.now()
+                        let position = host.reloadCurrentItem()
+                        let elapsedMs = Double(
+                            DispatchTime.now().uptimeNanoseconds
+                            - reloadStart.uptimeNanoseconds
+                        ) / 1_000_000
+                        // Wait 2 s so AVPlayer's async teardown of the
+                        // old item has time to actually release memory
+                        // before we sample. The synchronous part of
+                        // load() returns fast, but ARC + AVFoundation
+                        // internal cleanup happens off the main actor.
+                        try? await Task.sleep(for: .seconds(2))
+                        let rssAfter2s = Self.residentMemoryMB()
+                        let delta = rssAfter2s - rssBefore
+                        let pocLine = "[AetherEngine] POC reload result: "
+                            + "rssBefore=\(rssBefore)MB rssAfter+2s=\(rssAfter2s)MB "
+                            + "delta=\(delta)MB callDuration=\(String(format: "%.0f", elapsedMs))ms "
+                            + "position=\(position.map { String(format: "%.2fs", $0) } ?? "nil")"
+                        EngineLog.emit(pocLine, category: .engine)
+                        print(pocLine)
+                        self.lastReloadAt = Date()
+                    }
+                }
             }
         }
     }
