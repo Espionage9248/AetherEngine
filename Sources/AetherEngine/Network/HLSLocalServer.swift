@@ -460,26 +460,31 @@ final class HLSLocalServer: @unchecked Sendable {
         lines.append("#EXT-X-MEDIA-SEQUENCE:0")
         if typeIsEvent {
             lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
-            // Belt-and-suspenders byte-level change signal. Even if
-            // the segment list happens to be identical between two
-            // consecutive polls (e.g. AVPlayer polls faster than
-            // visibleHighWater advances, or the sliding window has
-            // plateaued near total), this custom tag still flips on
-            // every refresh so AVPlayer's "Playlist File unchanged"
-            // freshness check (CoreMediaErrorDomain -12888) can't fire
-            // on us. Tag names beginning with `X-` are reserved for
-            // custom use per RFC 8216 §4.2 and MUST be ignored by
-            // clients that don't recognise them.
+            // Belt-and-suspenders byte-level change signal. Tag names
+            // beginning with `X-` are reserved for custom use per
+            // RFC 8216 §4.2; clients that don't recognise them MUST
+            // ignore them. Only emitted for EVENT because that's the
+            // path with the freshness check.
             lines.append("#EXT-X-SODALITE-REFRESH:\(snapshot.refreshCounter)")
-        } else {
-            lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
         }
-        // EXT-X-START:TIME-OFFSET=0 pins the default start to the
-        // playlist origin so a replay-from-beginning load (the engine
-        // passes startPosition=nil) doesn't land the AVPlayer at the
-        // live edge of an EVENT playlist. Caller-side seeks still
-        // work because they're explicit AVPlayer time targets.
-        lines.append("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES")
+        // Deliberately omitting EXT-X-PLAYLIST-TYPE:VOD on the VOD
+        // path. DrHurt's manual-remux reference (which AVPlayer plays
+        // through cleanly on long-form 4K HDR HEVC) ships a playlist
+        // with EXT-X-ENDLIST but no PLAYLIST-TYPE tag at all. Per
+        // RFC 8216 §4.3.3.5, that combination ("absent" + ENDLIST)
+        // declares "this playlist may have been altered in ways that
+        // VOD playlists cannot, and is now complete". `:VOD` declares
+        // strictly more — "always was a fixed asset, free to cache
+        // for arbitrary scrub" — and AVPlayer's cache discipline may
+        // key off that difference. Empirically the only structural
+        // delta we can identify between DrHurt's known-good playlist
+        // and ours.
+        //
+        // EXT-X-START:TIME-OFFSET=0 also removed: it was added for
+        // the EVENT-mode replay-from-zero issue (AVPlayer's live-edge
+        // default on a growing playlist); irrelevant for plain
+        // ENDLIST-completed playlists where AVPlayer starts at time 0
+        // by default, and DrHurt's reference doesn't carry it.
         lines.append("#EXT-X-MAP:URI=\"init.mp4\"")
         for i in 0..<count {
             let dur = provider.segmentDuration(at: i)
