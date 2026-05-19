@@ -549,7 +549,24 @@ final class AVIOReader: @unchecked Sendable {
                 // no reference to URLSession's dispatch_data_t, so the
                 // task pool can release the response body immediately
                 // when the completion handler returns.
-                let copied = Data(d)
+                //
+                // Foundation may short-circuit Data(other) into a
+                // structural share when both are dispatch_data-backed
+                // (= the previous test showed only a partial leak
+                // reduction). Force a real memcpy by allocating an
+                // empty Data of the right size and writing the source
+                // bytes into it under withUnsafeMutableBytes. Foundation
+                // cannot alias this with the source — it has to do the
+                // copy.
+                let count = d.count
+                var copied = Data(count: count)
+                copied.withUnsafeMutableBytes { dst in
+                    d.withUnsafeBytes { src in
+                        if let dstBase = dst.baseAddress, let srcBase = src.baseAddress {
+                            dstBase.copyMemory(from: srcBase, byteCount: count)
+                        }
+                    }
+                }
                 result = (copied, r)
             } else {
                 error = AVIOReaderError.noResponse
