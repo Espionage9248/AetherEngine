@@ -327,7 +327,29 @@ final class MP4SegmentMuxer {
     @discardableResult
     func writePacket(_ packet: UnsafeMutablePointer<AVPacket>) -> Int32 {
         guard let ctx = formatContext else { return -1 }
-        return av_interleaved_write_frame(ctx, packet)
+        // av_write_frame instead of av_interleaved_write_frame: the
+        // interleaved path puts every packet into libavformat's
+        // packet_buffer linked list (one av_malloc per PacketListEntry +
+        // one av_packet_move_ref) and only drains it when ALL streams
+        // have at least one packet queued, or when a manual flush
+        // arrives. With +frag_custom that flush only happens at our
+        // ~4 s segment boundaries, so audio packets (~47/s FLAC) and
+        // video packets (~24/s HEVC) sit in the queue between cuts.
+        //
+        // The malloc diagnostic showed avg block size growing from
+        // 720 B to 10 KB while block count stays ~stable — the textbook
+        // signature of a long-lived linked list whose entries' attached
+        // packet buffers keep growing as we feed in bigger frames. The
+        // queue is bounded per fragment but its allocator footprint is
+        // not (libmalloc keeps the pages mapped after free for reuse).
+        //
+        // Matroska serves video+audio packets in source-file order
+        // which is already chronologically interleaved, so we don't
+        // need libavformat to re-sort. av_write_frame writes the packet
+        // straight through to mov_write_packet, which copies the bytes
+        // into trk->mdat_buf and unrefs the packet immediately. No
+        // intermediate queue.
+        return av_write_frame(ctx, packet)
     }
 
     /// Trigger a fragment cut, finalize the just-completed segment's
