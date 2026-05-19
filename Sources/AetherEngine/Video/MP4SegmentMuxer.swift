@@ -510,6 +510,22 @@ final class MP4SegmentMuxer {
         guard let raw = av_malloc(Int(bufSize)) else { return nil }
         let buf = raw.assumingMemoryBound(to: UInt8.self)
         let opaque = Unmanaged.passUnretained(muxer).toOpaque()
+        // Provide a stub seek callback that only answers AVSEEK_SIZE
+        // (returns 0 = unknown) and refuses every other whence. With
+        // a seek callback AND seekable = AVIO_SEEKABLE_NORMAL,
+        // libavformat's mov muxer skips the path it takes when it
+        // believes the output is non-seekable. The non-seekable path
+        // builds up sample-table state in memory in case the moov
+        // ever needs reconstruction; with +empty_moov+frag_custom
+        // that state should be unreachable but libavformat allocates
+        // it anyway. The diagnostic memprobe just confirmed mallocMB
+        // grows ~8 MB/s while block count is roughly flat, the
+        // signature of realloc-growing internal buffers — pointing at
+        // exactly this kind of state machine. seekable=1 lets the
+        // muxer drop that bookkeeping; if mov muxer ever actually
+        // tries to seek (it shouldn't with empty_moov+frag_custom),
+        // the stub returns -1 and the muxer reports a write error
+        // rather than crashing.
         guard let pb = avio_alloc_context(
             buf,
             bufSize,
@@ -517,12 +533,12 @@ final class MP4SegmentMuxer {
             opaque,
             nil,
             mp4SegmentMuxerSinkWrite,
-            nil
+            mp4SegmentMuxerSinkSeek
         ) else {
             av_free(raw)
             return nil
         }
-        pb.pointee.seekable = 0
+        pb.pointee.seekable = Int32(AVIO_SEEKABLE_NORMAL)
         return pb
     }
 
@@ -577,4 +593,21 @@ private func mp4SegmentMuxerSinkWrite(
     let muxer = Unmanaged<MP4SegmentMuxer>.fromOpaque(opaque).takeUnretainedValue()
     muxer.receive(buf, count: Int(size))
     return size
+}
+
+/// `avio_alloc_context` seek callback. We don't support actual seeking
+/// (writes are pure forward, fragment-style), but providing this stub
+/// alongside `seekable = AVIO_SEEKABLE_NORMAL` lets the mov muxer skip
+/// its non-seekable code path which buffers more state internally.
+/// AVSEEK_SIZE returns 0 ("unknown") which is harmless because
+/// +empty_moov+frag_custom never asks for size; every other whence
+/// returns -1 so any real seek attempt surfaces as a muxer write
+/// error rather than corrupted output.
+private func mp4SegmentMuxerSinkSeek(
+    opaque: UnsafeMutableRawPointer?,
+    offset: Int64,
+    whence: Int32
+) -> Int64 {
+    if whence == AVSEEK_SIZE { return 0 }
+    return -1
 }
