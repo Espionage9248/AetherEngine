@@ -288,6 +288,41 @@ final class Demuxer: @unchecked Sendable {
         return ctx.pointee.streams[Int(index)]
     }
 
+    /// Mark every stream outside `keep` with `AVDISCARD_ALL` so the
+    /// demuxer skips parsing + queueing its packets at the lowest
+    /// level. For our 4K HDR HEVC sources with 4 PGS subtitle streams
+    /// (large per-frame bitmaps) and 2 audio streams the matroska
+    /// demuxer otherwise reads cluster blocks for all 7 streams every
+    /// time it serves a video packet, parses them, and queues them in
+    /// its per-stream packet queue waiting for someone to ask. Our
+    /// pump silently drops them via `continue` at the consumer side,
+    /// but by then the demuxer has already done the work and the
+    /// queues hold the packets until av_read_frame iterates them out
+    /// and our pump throws them away.
+    ///
+    /// With `discard = AVDISCARD_ALL` the demuxer drops the packet
+    /// before parsing it into an AVPacket, eliminating the alloc +
+    /// queue + free cycle for every subtitle bitmap and unused audio
+    /// frame. Counted against the long-form 4K HDR RSS leak this is
+    /// directly proportional: PGS bitmap rate × ~4 streams cuts to
+    /// zero.
+    ///
+    /// Call after `avformat_find_stream_info` (i.e. after open
+    /// returns) and before any `readPacket` calls. Safe to call
+    /// multiple times.
+    func discardAllStreamsExcept(_ keep: Set<Int32>) {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        guard let ctx = formatContext else { return }
+        for i in 0..<Int32(ctx.pointee.nb_streams) {
+            guard let stream = ctx.pointee.streams[Int(i)] else { continue }
+            // AVDISCARD_DEFAULT = 0 (= passthrough), AVDISCARD_ALL = 48.
+            stream.pointee.discard = keep.contains(i)
+                ? AVDISCARD_DEFAULT
+                : AVDISCARD_ALL
+        }
+    }
+
     /// Enumerate the source's keyframe positions for the given stream
     /// from libavformat's index, returning each entry's `timestamp`
     /// field in the stream's native timebase.

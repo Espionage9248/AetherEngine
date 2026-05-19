@@ -439,6 +439,25 @@ final class HLSSegmentProducer: @unchecked Sendable {
             audioStream.pointee.time_base = audio.timeBase
         }
 
+        // 4c. Discard every source stream the pump doesn't use. With
+        //     4K HDR HEVC the typical Blu-ray remux ships 1 video + 2
+        //     audio + 4 PGS subtitle streams. Without explicit discard
+        //     the matroska demuxer parses + queues a packet for every
+        //     PGS frame (4K bitmaps, several KB each, fire on every
+        //     subtitle change) and the secondary unused audio track.
+        //     Our pump drops them via `continue` at the consumer side,
+        //     but the demuxer has already paid the parse + queue cost
+        //     and the AVPacket alloc / free round trip churns the heap.
+        //     `AVDISCARD_ALL` short-circuits all of that at parse time.
+        //     The subtitle path runs through a separate side-demuxer
+        //     instance, so dropping subtitles here is safe — the side
+        //     demuxer keeps its own streams enabled.
+        var keep: Set<Int32> = [videoStreamIndex]
+        if let audio = audio {
+            keep.insert(audio.sourceStreamIndex)
+        }
+        demuxer.discardAllStreamsExcept(keep)
+
         // 5. Configure hls muxer options. The mp4 sub-muxer's movflags
         //    are set inside hls_mux_init at libavformat/hlsenc.c:867
         //    (`+frag_custom+dash+delay_moov`); we do not override them.
