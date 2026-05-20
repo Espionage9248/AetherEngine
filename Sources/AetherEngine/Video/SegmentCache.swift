@@ -251,6 +251,15 @@ final class SegmentCache {
         return readMapped(url)
     }
 
+    /// Non-blocking URL lookup. Returns the cache file URL without
+    /// reading any bytes; used by the `sendfile(2)` fast path in the
+    /// local server. Returns nil when the segment isn't yet cached.
+    func peekURL(index: Int) -> URL? {
+        condition.lock()
+        defer { condition.unlock() }
+        return entries[index]
+    }
+
     /// Blocking lookup. Returns nil on timeout, on close, or when
     /// the producer never stores this index.
     func fetch(index: Int, timeout: TimeInterval = 15.0) -> Data? {

@@ -988,6 +988,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
         /// Steady (1-3) is normal AVPlayer keep-alive; rising count
         /// would point to a CFNetwork client leak.
         public let serverConnectionCount: Int
+        /// Lifetime bytes the HLS server has sent over all responses
+        /// (Data writeAll + sendfile combined). Should track
+        /// `muxerLifetimeFragmentBytes` for the segment-serve path
+        /// (modulo init.mp4 + playlist responses). Divergence flags a
+        /// drop or duplicate.
+        public let serverLifetimeBytesSent: Int
+        /// Of `serverLifetimeBytesSent`, how many went via the
+        /// `sendfile(2)` fast path (file → socket kernel-side, no
+        /// Foundation `Data`). Used to verify the fast path is
+        /// actually taken vs. silently falling back to the
+        /// Data-allocation path on every fetch.
+        public let serverSendfileBytesSent: Int
     }
 
     /// Read the current pipeline counters. Returns zeros for any
@@ -1005,7 +1017,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             audioBridgeSwrBytes: abLive?.swrDelayBytes ?? 0,
             muxerLifetimeFragmentBytes: producer?.muxerLifetimeFragmentBytes ?? 0,
             muxerFragmentCuts: producer?.muxerFragmentCuts ?? 0,
-            serverConnectionCount: server?.activeConnectionCount ?? 0
+            serverConnectionCount: server?.activeConnectionCount ?? 0,
+            serverLifetimeBytesSent: server?.lifetimeBytesSent ?? 0,
+            serverSendfileBytesSent: server?.lifetimeSendfileBytes ?? 0
         )
     }
 
@@ -1868,6 +1882,26 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
 
     func initSegment() -> Data? {
         return cache.fetchInit(timeout: 30.0)
+    }
+
+    /// File URL for a cached segment without materializing any bytes.
+    /// Used by `HLSLocalServer` to take the `sendfile(2)` fast path
+    /// (file → socket entirely kernel-side, no Foundation `Data`
+    /// involvement). Returns nil when the segment isn't yet cached,
+    /// is out of range, or its cache entry has been pruned. This is
+    /// intentionally a pure-lookup: no producer restart, no window
+    /// extension, no `declareTarget`. The caller falls back to
+    /// `mediaSegment(at:)` (which does drive those side effects) on
+    /// nil.
+    func mediaSegmentURL(at index: Int) -> URL? {
+        guard index >= 0, index < segments.count else { return nil }
+        // Drive cache-window + restart side effects same as the Data
+        // path; only the byte materialization changes. Without this
+        // the sendfile path would skip the producer restart on
+        // out-of-range fetches and AVPlayer would 404 indefinitely.
+        extendVisibleWindow(toCover: index)
+        cache.declareTarget(index)
+        return cache.peekURL(index: index)
     }
 
     func mediaSegment(at index: Int) -> Data? {

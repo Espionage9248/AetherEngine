@@ -26,6 +26,14 @@ protocol HLSSegmentProvider: AnyObject {
     /// for indices beyond `segmentCount`.
     func mediaSegment(at index: Int) -> Data?
 
+    /// File URL for media segment `index` when the segment is backed
+    /// by a real file on disk (the cache adopt path). Returns nil for
+    /// providers that hold segments only in memory (BufferedSegmentProvider
+    /// audio path) or when the segment isn't yet available. Lets the
+    /// server bypass Foundation's `Data(contentsOf:)` entirely and
+    /// stream the file straight to the socket via `sendfile(2)`.
+    func mediaSegmentURL(at index: Int) -> URL?
+
     /// Number of segments currently known. May grow over time for
     /// `.event` playlists, fixed for `.vod` playlists.
     var segmentCount: Int { get }
@@ -91,6 +99,11 @@ protocol HLSSegmentProvider: AnyObject {
 }
 
 extension HLSSegmentProvider {
+    /// Default: no file backing. Providers that store segments on
+    /// disk override to return the file URL so the server can use
+    /// the `sendfile(2)` fast path.
+    func mediaSegmentURL(at index: Int) -> URL? { nil }
+
     var masterCodecs: String? { nil }
     var masterResolution: (width: Int, height: Int)? { nil }
     var masterVideoRange: HLSVideoRange? { nil }
@@ -235,6 +248,41 @@ final class HLSLocalServer: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         return clientFds.count
+    }
+
+    /// Lifetime sum of bytes ever sent through `writeAll` and
+    /// `sendfileAll` over all responses. Compared against the muxer's
+    /// `muxBytesMB` in the engine memprobe — equality confirms the
+    /// data path is intact (no duplicate sends, no dropped bytes).
+    private let byteCounterLock = NSLock()
+    private var _lifetimeBytesSent: Int = 0
+    var lifetimeBytesSent: Int {
+        byteCounterLock.lock()
+        defer { byteCounterLock.unlock() }
+        return _lifetimeBytesSent
+    }
+    private func bumpBytesSent(_ n: Int) {
+        guard n > 0 else { return }
+        byteCounterLock.lock()
+        _lifetimeBytesSent &+= n
+        byteCounterLock.unlock()
+    }
+
+    /// Lifetime count of segment bytes sent via the `sendfile(2)`
+    /// fast path (file → socket entirely in-kernel, zero Swift Data
+    /// involvement). Used to verify the path is actually taken vs.
+    /// falling back to the Data path.
+    private var _lifetimeSendfileBytes: Int = 0
+    var lifetimeSendfileBytes: Int {
+        byteCounterLock.lock()
+        defer { byteCounterLock.unlock() }
+        return _lifetimeSendfileBytes
+    }
+    private func bumpSendfileBytes(_ n: Int) {
+        guard n > 0 else { return }
+        byteCounterLock.lock()
+        _lifetimeSendfileBytes &+= n
+        byteCounterLock.unlock()
     }
 
     /// One-shot flags so we log each playlist's full body once per
@@ -582,6 +630,18 @@ final class HLSLocalServer: @unchecked Sendable {
                         if seg0FetchTime == nil { seg0FetchTime = Date() }
                         stateLock.unlock()
                     }
+                    // Fast path: if the segment is file-backed (cache
+                    // adopt path), stream via `sendfile(2)` directly
+                    // from the page cache to the socket — bypasses
+                    // Foundation `Data(contentsOf:)` entirely. Tests
+                    // the hypothesis that `.alwaysMapped` was silently
+                    // materializing the segment into anonymous heap
+                    // per fetch, leaking ~one-segment-worth per serve.
+                    if let url = provider?.mediaSegmentURL(at: index) {
+                        return send200File(fd: fd, path: normalizedPath,
+                                            fileURL: url,
+                                            contentType: "video/mp4")
+                    }
                     if let data = provider?.mediaSegment(at: index),
                        !data.isEmpty {
                         return send200(fd: fd, path: normalizedPath, data: data,
@@ -631,6 +691,40 @@ final class HLSLocalServer: @unchecked Sendable {
         return writeAll(fd: fd, data: data, path: path)
     }
 
+    /// HTTP 200 response whose body is streamed from a file via
+    /// `sendfile(2)`. Header goes through `writeAll` as usual; body
+    /// stays kernel-side. Returns false on file-open failure (treat
+    /// as 5xx the caller logs and the connection dies), broken pipe,
+    /// or zero-length file.
+    private func send200File(fd: Int32, path: String, fileURL: URL, contentType: String) -> Bool {
+        // Stat the file to fill Content-Length. If the file is missing
+        // or zero-length we treat as a cache miss → 404, same as the
+        // Data path.
+        let fsAttrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
+        let fileSize = (fsAttrs?[.size] as? Int) ?? 0
+        if fileSize == 0 {
+            return send404(fd: fd, path: path, reason: "file \(fileURL.lastPathComponent) missing or empty")
+        }
+
+        let header =
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: \(contentType)\r\n" +
+            "Content-Length: \(fileSize)\r\n" +
+            "Access-Control-Allow-Origin: *\r\n" +
+            "Cache-Control: no-store\r\n" +
+            "Connection: keep-alive\r\n" +
+            "\r\n"
+        let headerData = Data(header.utf8)
+
+        EngineLog.emit("[HLSLocalServer] -> 200 \(path) bytes=\(fileSize) type=\(contentType) [sendfile]",
+                       category: .hlsServer)
+
+        guard writeAll(fd: fd, data: headerData, path: "\(path) [header]") else {
+            return false
+        }
+        return sendfileAll(fileURL: fileURL, socketFd: fd, path: path)
+    }
+
     private func send404(fd: Int32, path: String, reason: String) -> Bool {
         let response =
             "HTTP/1.1 404 Not Found\r\n" +
@@ -671,7 +765,69 @@ final class HLSLocalServer: @unchecked Sendable {
             }
             written += result
         }
+        bumpBytesSent(total)
         return true
+    }
+
+    /// Stream a file to the socket via `sendfile(2)`, entirely
+    /// in-kernel (file page cache → socket send buffer, no user-space
+    /// data copy). Replaces the `Data(contentsOf: .alwaysMapped) +
+    /// withUnsafeBytes(send)` path for the segment GETs to test the
+    /// hypothesis that Foundation `Data(contentsOf:)` was silently
+    /// materializing the segment into anonymous heap despite the
+    /// `.alwaysMapped` hint.
+    ///
+    /// Darwin `sendfile(2)` signature:
+    ///   `int sendfile(int fd, int s, off_t offset, off_t *len,
+    ///                 struct sf_hdtr *hdtr, int flags);`
+    /// where `*len` is in/out: caller passes total bytes wanted (or 0
+    /// for EOF), kernel writes bytes actually sent on return.
+    ///
+    /// Returns false on broken pipe / file open failure / partial
+    /// send that we couldn't recover from. The caller treats failure
+    /// the same as a `writeAll` failure: close the connection.
+    private func sendfileAll(fileURL: URL, socketFd: Int32, path: String) -> Bool {
+        // `Darwin.open` is variadic so Swift can't import it directly.
+        // FileHandle(forReadingFrom:) wraps the same syscall, returns
+        // an autoreleased object whose fileDescriptor we own for the
+        // sendfile call. `closeFile()` releases the fd.
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forReadingFrom: fileURL)
+        } catch {
+            EngineLog.emit("[HLSLocalServer] sendfile open failed \(path): \(error)",
+                           category: .hlsServer)
+            return false
+        }
+        let fileFd = handle.fileDescriptor
+        defer { try? handle.close() }
+
+        var offset: off_t = 0
+        var totalSent: Int = 0
+        while true {
+            var len: off_t = 0  // 0 = send to EOF
+            let result = sendfile(fileFd, socketFd, offset, &len, nil, 0)
+            // `len` always carries the bytes actually pushed,
+            // regardless of return code (Apple's sendfile semantics).
+            offset += len
+            totalSent += Int(len)
+            if result == 0 {
+                // Full file transferred.
+                bumpBytesSent(Int(totalSent))
+                bumpSendfileBytes(Int(totalSent))
+                return true
+            }
+            // result < 0: error or partial. errno tells us which.
+            let err = errno
+            if err == EINTR || err == EAGAIN {
+                // Partial send. Loop with new offset; kernel will
+                // resume from where it left off.
+                continue
+            }
+            EngineLog.emit("[HLSLocalServer] sendfile failed \(path): errno=\(err) sent=\(totalSent)",
+                           category: .hlsServer)
+            return false
+        }
     }
 
     // MARK: - Playlist construction
