@@ -978,6 +978,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
         public let audioBridgeFifoBytes: Int
         public let audioBridgeSwrBytes: Int
         public var audioBridgeTotalBytes: Int { audioBridgeFifoBytes + audioBridgeSwrBytes }
+        /// Cumulative bytes the current MP4SegmentMuxer has emitted
+        /// through its FragmentSplitter over its lifetime. Resets on
+        /// muxer rebuild (currently never — the muxer is session-long).
+        /// Used as the muxer-leak attribution baseline.
+        public let muxerLifetimeFragmentBytes: Int
+        public let muxerFragmentCuts: Int
+        /// Accepted-not-yet-closed connections on the local HLS server.
+        /// Steady (1-3) is normal AVPlayer keep-alive; rising count
+        /// would point to a CFNetwork client leak.
+        public let serverConnectionCount: Int
     }
 
     /// Read the current pipeline counters. Returns zeros for any
@@ -992,7 +1002,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
             avioBytesFetched: demuxer?.avioBytesFetched ?? 0,
             audioFifoSamples: audioBridge?.fifoSampleCount ?? 0,
             audioBridgeFifoBytes: abLive?.fifoBytes ?? 0,
-            audioBridgeSwrBytes: abLive?.swrDelayBytes ?? 0
+            audioBridgeSwrBytes: abLive?.swrDelayBytes ?? 0,
+            muxerLifetimeFragmentBytes: producer?.muxerLifetimeFragmentBytes ?? 0,
+            muxerFragmentCuts: producer?.muxerFragmentCuts ?? 0,
+            serverConnectionCount: server?.activeConnectionCount ?? 0
         )
     }
 

@@ -219,6 +219,7 @@ final class MP4SegmentMuxer {
                     written += n
                 }
                 counter.bytesWrittenCurrentSegment += count
+                counter.lifetimeFragmentBytes += count
             }
         )
 
@@ -313,6 +314,32 @@ final class MP4SegmentMuxer {
     /// alive for the muxer's lifetime.
     private let byteCounter: ByteCounter
 
+    // MARK: - Diagnostic probes
+
+    /// Cumulative bytes ever emitted through the splitter's fragment
+    /// callback over the muxer's lifetime. Used by the engine memory
+    /// probe to compare libavformat's reported output volume vs.
+    /// observed RSS growth. If lifetime bytes climb at ~observed leak
+    /// rate, the muxer is retaining old fragment data; if much lower,
+    /// the leak is elsewhere in libavformat (sample tables, frag_info)
+    /// or outside the muxer entirely.
+    var lifetimeFragmentBytesEmitted: Int { byteCounter.lifetimeFragmentBytes }
+
+    /// Count of successful fragment cuts since init. Diverging from
+    /// `producerPacketsWritten / pktsPerFragment` flags a flush stall.
+    var fragmentCutCount: Int { byteCounter.fragmentCuts }
+
+    /// Bytes the libavformat AVIO buffer is currently holding before
+    /// flush. Bounded by our 65536-byte alloc; reported here mostly to
+    /// confirm pb stays bounded vs. any imagined growth.
+    var avioPendingBytes: Int {
+        guard let pb = pb else { return 0 }
+        let base = UInt(bitPattern: Int(bitPattern: OpaquePointer(pb.pointee.buffer)))
+        let cur = UInt(bitPattern: Int(bitPattern: OpaquePointer(pb.pointee.buf_ptr)))
+        guard cur >= base else { return 0 }
+        return Int(cur - base)
+    }
+
     // MARK: - Pump-side API
 
     /// Write one packet via av_interleaved_write_frame. Caller has
@@ -384,6 +411,8 @@ final class MP4SegmentMuxer {
             try? FileManager.default.removeItem(at: completedPath)
             return nil
         }
+
+        byteCounter.fragmentCuts += 1
 
         // 3. Rotate to the next segment's staging file.
         let nextPath = Self.stagingPath(forSegmentIndex: nextIdx, in: sessionDir)
@@ -578,6 +607,12 @@ private final class ByteCounter {
     var bytesWrittenCurrentSegment: Int = 0
     /// Sticky once any `write(2)` call returns an error.
     var writeFailed: Bool = false
+    /// Cumulative fragment bytes ever emitted through the splitter
+    /// for the muxer's lifetime. Monotone counter; never reset.
+    var lifetimeFragmentBytes: Int = 0
+    /// Successful fragment cuts since muxer init. Bumped at each
+    /// `cutFragmentForNextSegment(_:)` call that produced bytes.
+    var fragmentCuts: Int = 0
 }
 
 // MARK: - C callback bridge

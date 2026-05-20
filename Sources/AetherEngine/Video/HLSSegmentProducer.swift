@@ -349,6 +349,28 @@ final class HLSSegmentProducer: @unchecked Sendable {
         packetCounterLock.unlock()
     }
 
+    /// Lifetime fragment bytes the current muxer has emitted via the
+    /// FragmentSplitter. Compared against observed RSS growth in the
+    /// engine memprobe to attribute the long-form leak: if this counter
+    /// climbs at the leak rate, libavformat is retaining the bytes
+    /// somewhere reachable; if much slower, the leak is outside the
+    /// muxer's output volume.
+    var muxerLifetimeFragmentBytes: Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return currentMuxer?.lifetimeFragmentBytesEmitted ?? 0
+    }
+
+    /// Number of successful fragment cuts the current muxer has done.
+    /// Together with muxerLifetimeFragmentBytes this gives an average
+    /// fragment size; divergence from the per-segment served bytes would
+    /// flag a hidden secondary output.
+    var muxerFragmentCuts: Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return currentMuxer?.fragmentCutCount ?? 0
+    }
+
     /// Set once the pump exits (EOF, error, or `stop()`). Read by
     /// `waitForFinish(timeout:)` so the host can synchronously
     /// tear down this producer before constructing a successor at a

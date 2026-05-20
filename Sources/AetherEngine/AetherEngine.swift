@@ -1528,6 +1528,9 @@ public final class AetherEngine: ObservableObject {
                 let abFifoKB = (stats?.audioBridgeFifoBytes ?? 0) / 1024
                 let abSwrKB = (stats?.audioBridgeSwrBytes ?? 0) / 1024
                 let abTotKB = (stats?.audioBridgeTotalBytes ?? 0) / 1024
+                let muxBytesMB = (stats?.muxerLifetimeFragmentBytes ?? 0) / 1024 / 1024
+                let muxCuts = stats?.muxerFragmentCuts ?? 0
+                let srvConns = stats?.serverConnectionCount ?? 0
 
                 // VM breakdown so the leak source is visible at probe
                 // time: internal (Swift / libavformat heap) vs external
@@ -1561,6 +1564,8 @@ public final class AetherEngine: ObservableObject {
                     + "packetsWritten=\(packetsWritten) "
                     + "audioFifo=\(audioFifo) "
                     + "abFifoKB=\(abFifoKB) abSwrKB=\(abSwrKB) abTotKB=\(abTotKB) "
+                    + "muxBytesMB=\(muxBytesMB) muxCuts=\(muxCuts) "
+                    + "srvConns=\(srvConns) "
                     + "subCues=\(cueCount) "
                     + "audioTracks=\(self.audioTracks.count) "
                     + "subTracks=\(self.subtitleTracks.count) "

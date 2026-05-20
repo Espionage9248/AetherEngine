@@ -226,6 +226,17 @@ final class HLSLocalServer: @unchecked Sendable {
     /// while holding `stateLock`.
     private var clientFds = Set<Int32>()
 
+    /// Current count of accepted, not-yet-closed client connections.
+    /// Read by the engine memory probe to spot CFNetwork loopback
+    /// keep-alive accumulation. AVPlayer typically holds 1-3 long-
+    /// lived connections to the local server; a steadily rising number
+    /// would point here.
+    var activeConnectionCount: Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return clientFds.count
+    }
+
     /// One-shot flags so we log each playlist's full body once per
     /// session instead of on every AVPlayer re-fetch.
     private var loggedMasterPlaylist = false
