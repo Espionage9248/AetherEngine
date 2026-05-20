@@ -122,6 +122,21 @@ final class EngineResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelegat
         // `/seg42.mp4`. Strip the leading slash.
         let path = url.path.hasPrefix("/") ? String(url.path.dropFirst()) : url.path
 
+        // Log the request shape so we can see what AVPlayer actually
+        // asks for (range, info-only, etc.) — invaluable when chasing
+        // CoreMedia parse failures.
+        let infoOnly = loadingRequest.contentInformationRequest != nil
+            && loadingRequest.dataRequest == nil
+        let rangeStr: String
+        if let dr = loadingRequest.dataRequest {
+            let allToEnd = dr.requestsAllDataToEndOfResource
+            rangeStr = "offset=\(dr.requestedOffset) length=\(dr.requestedLength) allToEnd=\(allToEnd)"
+        } else {
+            rangeStr = "no-dataRequest"
+        }
+        EngineLog.emit("[ResourceLoader] REQ path=\(path) info=\(infoOnly) \(rangeStr)",
+                       category: .hlsServer)
+
         switch path {
         case "master.m3u8":
             return handlePlaylist(loadingRequest: loadingRequest, isMaster: true)
@@ -174,7 +189,7 @@ final class EngineResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelegat
         loadingRequest.contentInformationRequest?.contentType = "application/vnd.apple.mpegurl"
         loadingRequest.contentInformationRequest?.contentLength = Int64(data.count)
         loadingRequest.contentInformationRequest?.isByteRangeAccessSupported = false
-        respondAndFinish(loadingRequest, with: data)
+        respondAndFinish(loadingRequest, with: data, tag: "playlist(\(isMaster ? "master" : "media"))")
         return true
     }
 
@@ -188,7 +203,7 @@ final class EngineResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelegat
         loadingRequest.contentInformationRequest?.contentType = "video/mp4"
         loadingRequest.contentInformationRequest?.contentLength = Int64(data.count)
         loadingRequest.contentInformationRequest?.isByteRangeAccessSupported = true
-        respondAndFinish(loadingRequest, with: data)
+        respondAndFinish(loadingRequest, with: data, tag: "init.mp4")
         return true
     }
 
@@ -217,7 +232,7 @@ final class EngineResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelegat
             loadingRequest.contentInformationRequest?.contentType = "video/mp4"
             loadingRequest.contentInformationRequest?.contentLength = Int64(data.count)
             loadingRequest.contentInformationRequest?.isByteRangeAccessSupported = true
-            respondAndFinish(loadingRequest, with: data)
+            respondAndFinish(loadingRequest, with: data, tag: "seg[\(index)]-data")
             return true
         }
         let providerCount = provider.segmentCount
@@ -317,28 +332,37 @@ final class EngineResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelegat
 
     private func respondAndFinish(
         _ loadingRequest: AVAssetResourceLoadingRequest,
-        with data: Data
+        with data: Data,
+        tag: String
     ) {
         // Honour any byte-range subselection on small responses too;
         // playlist requests can in principle ask for a range though
         // AVPlayer typically asks for the whole playlist body.
+        var bytesDelivered = 0
         if let dataRequest = loadingRequest.dataRequest {
             let offset = Int(dataRequest.requestedOffset)
-            let count: Int
-            if dataRequest.requestsAllDataToEndOfResource {
-                count = data.count - offset
+            if dataRequest.requestsAllDataToEndOfResource || offset == 0 && dataRequest.requestedLength >= data.count - offset {
+                // Whole-resource / from-start path: pass the original
+                // Data through (avoids forcing a copy via subdata for
+                // multi-MB segment Data wrappers).
+                if offset == 0 {
+                    dataRequest.respond(with: data)
+                    bytesDelivered = data.count
+                } else {
+                    let slice = data.subdata(in: offset..<data.count)
+                    dataRequest.respond(with: slice)
+                    bytesDelivered = slice.count
+                }
             } else {
-                count = min(dataRequest.requestedLength, data.count - offset)
-            }
-            if offset >= 0, offset + count <= data.count {
-                let slice = data.subdata(in: offset..<(offset + count))
+                let length = min(dataRequest.requestedLength, data.count - offset)
+                let slice = data.subdata(in: offset..<(offset + length))
                 dataRequest.respond(with: slice)
-                bumpBytesServed(slice.count)
-            } else {
-                dataRequest.respond(with: data)
-                bumpBytesServed(data.count)
+                bytesDelivered = slice.count
             }
         }
         loadingRequest.finishLoading()
+        bumpBytesServed(bytesDelivered)
+        EngineLog.emit("[ResourceLoader] OK \(tag) delivered=\(bytesDelivered) total=\(data.count)",
+                       category: .hlsServer)
     }
 }
