@@ -769,64 +769,73 @@ final class HLSLocalServer: @unchecked Sendable {
         return true
     }
 
-    /// Stream a file to the socket via `sendfile(2)`, entirely
-    /// in-kernel (file page cache → socket send buffer, no user-space
-    /// data copy). Replaces the `Data(contentsOf: .alwaysMapped) +
-    /// withUnsafeBytes(send)` path for the segment GETs to test the
-    /// hypothesis that Foundation `Data(contentsOf:)` was silently
-    /// materializing the segment into anonymous heap despite the
-    /// `.alwaysMapped` hint.
+    /// Stream a file to the socket through a fixed-size reusable
+    /// buffer. Bypasses Foundation `Data(contentsOf:)` so any
+    /// silent heap materialization that path triggered on tvOS
+    /// cannot account for the residual leak.
     ///
-    /// Darwin `sendfile(2)` signature:
-    ///   `int sendfile(int fd, int s, off_t offset, off_t *len,
-    ///                 struct sf_hdtr *hdtr, int flags);`
-    /// where `*len` is in/out: caller passes total bytes wanted (or 0
-    /// for EOF), kernel writes bytes actually sent on return.
+    /// (Tried `sendfile(2)` first — the obvious zero-copy approach —
+    /// but tvOS sandboxes that syscall and the process gets SIGSYS'd
+    /// on first call. Reverted to chunked read+send.)
+    ///
+    /// Buffer: one 256 KB heap allocation per call, deallocated on
+    /// return. Constant per-request memory; the kernel-side page
+    /// cache services the reads.
     ///
     /// Returns false on broken pipe / file open failure / partial
-    /// send that we couldn't recover from. The caller treats failure
-    /// the same as a `writeAll` failure: close the connection.
+    /// send the kernel won't drain. The caller treats failure the
+    /// same as a `writeAll` failure: close the connection.
     private func sendfileAll(fileURL: URL, socketFd: Int32, path: String) -> Bool {
-        // `Darwin.open` is variadic so Swift can't import it directly.
-        // FileHandle(forReadingFrom:) wraps the same syscall, returns
-        // an autoreleased object whose fileDescriptor we own for the
-        // sendfile call. `closeFile()` releases the fd.
         let handle: FileHandle
         do {
             handle = try FileHandle(forReadingFrom: fileURL)
         } catch {
-            EngineLog.emit("[HLSLocalServer] sendfile open failed \(path): \(error)",
+            EngineLog.emit("[HLSLocalServer] file open failed \(path): \(error)",
                            category: .hlsServer)
             return false
         }
         let fileFd = handle.fileDescriptor
         defer { try? handle.close() }
 
-        var offset: off_t = 0
+        let chunkSize = 256 * 1024
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: chunkSize)
+        defer { buffer.deallocate() }
+
         var totalSent: Int = 0
         while true {
-            var len: off_t = 0  // 0 = send to EOF
-            let result = sendfile(fileFd, socketFd, offset, &len, nil, 0)
-            // `len` always carries the bytes actually pushed,
-            // regardless of return code (Apple's sendfile semantics).
-            offset += len
-            totalSent += Int(len)
-            if result == 0 {
-                // Full file transferred.
-                bumpBytesSent(Int(totalSent))
-                bumpSendfileBytes(Int(totalSent))
+            let nRead = read(fileFd, buffer, chunkSize)
+            if nRead == 0 {
+                // EOF. Full file transferred.
+                bumpBytesSent(totalSent)
+                bumpSendfileBytes(totalSent)
                 return true
             }
-            // result < 0: error or partial. errno tells us which.
-            let err = errno
-            if err == EINTR || err == EAGAIN {
-                // Partial send. Loop with new offset; kernel will
-                // resume from where it left off.
-                continue
+            if nRead < 0 {
+                let err = errno
+                if err == EINTR { continue }
+                EngineLog.emit("[HLSLocalServer] file read failed \(path): errno=\(err) sent=\(totalSent)",
+                               category: .hlsServer)
+                return false
             }
-            EngineLog.emit("[HLSLocalServer] sendfile failed \(path): errno=\(err) sent=\(totalSent)",
-                           category: .hlsServer)
-            return false
+            // Drain this chunk to the socket. Partial sends loop.
+            var written = 0
+            while written < nRead {
+                let n = send(socketFd, buffer.advanced(by: written), nRead - written, 0)
+                if n < 0 {
+                    let err = errno
+                    if err == EINTR { continue }
+                    EngineLog.emit("[HLSLocalServer] send failed \(path): errno=\(err) sent=\(totalSent + written)",
+                                   category: .hlsServer)
+                    return false
+                }
+                if n == 0 {
+                    EngineLog.emit("[HLSLocalServer] send returned 0 \(path) sent=\(totalSent + written)",
+                                   category: .hlsServer)
+                    return false
+                }
+                written += n
+            }
+            totalSent += nRead
         }
     }
 
