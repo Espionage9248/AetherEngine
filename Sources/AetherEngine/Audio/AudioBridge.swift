@@ -11,7 +11,7 @@ import Libswresample
 /// in the same fMP4 fragments.
 ///
 /// Modes (see `AudioBridge.Mode`):
-///   - `.surroundCompat` (default): EAC3 5.1 at 640 kbps. AVPlayer
+///   - `.surroundCompat` (default): EAC3 at 128 kbps per channel (256 kbps stereo, 768 kbps 5.1). AVPlayer
 ///     hands the encoded bitstream to HDMI; the sink decodes its own
 ///     5.1. Works on essentially every modern AVR + soundbar
 ///     including LPCM-stereo-only routes (Sonos Arc, Samsung HW-Q,
@@ -44,7 +44,7 @@ import Libswresample
 /// the soundbar / LPCM-stereo-only install base is the majority of
 /// the consumer market.
 ///
-/// - `.surroundCompat`: EAC3 5.1 at 640 kbps, AVPlayer → HDMI
+/// - `.surroundCompat`: EAC3 at 128 kbps per channel (256 kbps stereo, 768 kbps 5.1), AVPlayer → HDMI
 ///   bitstream tunnel. Lossy but surround works on essentially every
 ///   modern AVR + soundbar.
 /// - `.lossless`: FLAC up to 7.1, AVPlayer → LPCM HDMI route. Needs
@@ -155,7 +155,7 @@ final class AudioBridge: @unchecked Sendable {
 
     /// Opens the source decoder + bridge encoder. The encoder choice
     /// is picked by `mode`:
-    ///   - `.surroundCompat`: EAC3 5.1 at 640 kbps via FFmpeg's eac3
+    ///   - `.surroundCompat`: EAC3 at 128 kbps per channel (256 kbps stereo, 768 kbps 5.1) via FFmpeg's eac3
     ///     encoder. Caps channels at 6, sample format FLTP.
     ///   - `.lossless`: FLAC at source channel count via FFmpeg's flac
     ///     encoder. Caps at 8 channels (FLAC max), sample format S16
@@ -230,7 +230,7 @@ final class AudioBridge: @unchecked Sendable {
         }
 
         // 2. Bridge encoder. Selected by mode:
-        //   - .surroundCompat → AV_CODEC_ID_EAC3, 640 kbps, max 6 ch
+        //   - .surroundCompat → AV_CODEC_ID_EAC3, 128 kbps per channel, max 6 ch
         //   - .lossless       → AV_CODEC_ID_FLAC, VBR, max 8 ch
         let encoderCodecID: AVCodecID
         let maxEncodedChannels: Int32
@@ -239,14 +239,16 @@ final class AudioBridge: @unchecked Sendable {
         case .surroundCompat:
             encoderCodecID = AV_CODEC_ID_EAC3
             maxEncodedChannels = 6
-            // 640 kbps = 5 x 128 kbps per channel pair, the EAC3
-            // "transparent" bitrate per Dolby's reference profiles —
-            // perceptually indistinguishable from the lossless source
-            // for 5.1 content. Lower rates (384 kbps was tested but
-            // never shipped) save ~40% bandwidth at the cost of
-            // audible artefacts on demanding passages. DrHurt's
-            // suggestion on AetherEngine#4, sound logic.
-            encoderBitRate = 640_000
+            // Bitrate is computed dynamically per output channel count
+            // below (after the channel-cap resolves). 128 kbps per
+            // channel is the EAC3 "transparent" reference profile per
+            // DrHurt's pointer on AetherEngine#4: 256 kbps stereo,
+            // 768 kbps 5.1, scales naturally if the channel cap ever
+            // gets bumped (Nomis101's PR 21668 dependent-substream
+            // patch enables 7.1 in EAC3 at 1024 kbps). Saves ~60% of
+            // the bandwidth that a flat 640 kbps cost on stereo /
+            // mono bridge paths (Opus 2.0, MP3, etc.).
+            encoderBitRate = 0  // placeholder, overwritten below
         case .lossless:
             encoderCodecID = AV_CODEC_ID_FLAC
             maxEncodedChannels = 8
@@ -312,11 +314,14 @@ final class AudioBridge: @unchecked Sendable {
         // encoder's; the resampler picks Apple-compatible layout
         // ordering.
         let nChannels: Int32 = min(resolvedChannels, maxEncodedChannels)
+        let logBitRate: String = mode == .surroundCompat
+            ? "\(Int64(nChannels) * 128) kbps"
+            : "VBR"
         EngineLog.emit(
             "[AudioBridge] init: mode=\(mode.rawValue) "
             + "srcCodec=\(srcCodecID.rawValue) sampleRate=\(sampleRate) "
             + "sourceChannels=\(resolvedChannels) "
-            + "encoderChannels=\(nChannels) "
+            + "encoderChannels=\(nChannels) bitRate=\(logBitRate) "
             + "(source=\(resolvedSource), container=\(containerChannels), decoder=\(decoderChannels))",
             category: .session
         )
@@ -324,7 +329,17 @@ final class AudioBridge: @unchecked Sendable {
         enc.pointee.sample_rate = sampleRate
         enc.pointee.sample_fmt = pcmSampleFmt
         enc.pointee.bits_per_raw_sample = pcmBitsPerRawSample
-        enc.pointee.bit_rate = encoderBitRate
+        // Dynamic per-channel bitrate for the EAC3 path (128 kbps per
+        // channel, the Dolby reference transparent profile). For FLAC
+        // (`.lossless` mode) stay at 0 = unlimited VBR.
+        let resolvedBitRate: Int64
+        switch mode {
+        case .surroundCompat:
+            resolvedBitRate = Int64(nChannels) * 128_000
+        case .lossless:
+            resolvedBitRate = 0
+        }
+        enc.pointee.bit_rate = resolvedBitRate
         enc.pointee.time_base = AVRational(num: 1, den: sampleRate)
         var encLayout = AVChannelLayout()
         av_channel_layout_default(&encLayout, nChannels)
