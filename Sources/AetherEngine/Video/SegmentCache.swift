@@ -75,11 +75,21 @@ final class SegmentCache {
     /// have to stat every file in the session directory on each tick.
     private var _totalBytes: Int = 0
 
-    /// Tightened from (20, 15)=35 entries. At 4K HDR HEVC segment sizes
-    /// (~10 MB/seg) the old window held 350 MB on disk; (10, 5)=15
-    /// keeps the producer's forward runway and the cheap backward-
-    /// scrub window without burning disk space we don't need.
-    init(forwardWindow: Int = 10, backwardWindow: Int = 5) {
+    /// (10, 20)=30 entries. At 4K HDR HEVC segment sizes (~10 MB/seg)
+    /// this holds ~300 MB on disk: 10 forward, 20 backward. The
+    /// asymmetric weighting toward backward is intentional. The
+    /// forward window has a hard cap from `bufferAheadSegments` on
+    /// the producer (we don't want to race ahead of AVPlayer's
+    /// playback head), but the backward window only costs disk and
+    /// directly determines how often AVPlayer's backward refetches
+    /// trigger a producer restart. With Continuous Audio Connection
+    /// active on tvOS, AVPlayer commonly refetches ~7-10 segments
+    /// backward for audio gapless handover to the HDMI sink. A small
+    /// backward window made every such refetch cascade into a chain
+    /// of restarts, each one resetting the audio bridge encoder PTS
+    /// and producing audible glitches. 20 covers the observed
+    /// backward range comfortably without doubling disk pressure.
+    init(forwardWindow: Int = 10, backwardWindow: Int = 20) {
         self.forwardWindow = forwardWindow
         self.backwardWindow = backwardWindow
 

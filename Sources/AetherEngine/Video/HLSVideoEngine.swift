@@ -1921,14 +1921,20 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
         //     seek past where the producer can reach via backpressure,
         //     restart.
         //   - index nominally within the cache's [min..max] range but
-        //     peek failed → a HOLE in the cache. Happens after CC's
-        //     +10s skip: AVPlayer rebuffers from a position behind the
-        //     skip target, declareTarget slides the window back, the
-        //     prune evicts a segment AVPlayer will need ~10s later when
-        //     it plays through to it. Producer is by then past the
-        //     window's forward edge and produces into oblivion (every
-        //     store gets pruned immediately for being out of window).
-        //     Restart at `index` so the producer re-produces it.
+        //     peek failed → could be a real hole OR producer-in-flight
+        //     that hasn't yet written this segment. Wait briefly; only
+        //     restart if the wait times out. Without this short wait
+        //     every restart cascades: producer restarts at N, finishes
+        //     writing N, returns to caller; AVPlayer then GETs N+1, but
+        //     producer hasn't written N+1 yet so peek returns nil while
+        //     cache.range is (N..M) from the previous producer's leftover.
+        //     The "hole" branch triggers a fresh restart at N+1, which
+        //     repeats the pattern for N+2, N+3, etc. A 2s wait absorbs
+        //     the typical 100-500ms producer write cadence and breaks
+        //     the cascade. True holes (rare; happen after CC's +10s skip
+        //     when AVPlayer rebuffers behind the skip target and the
+        //     declareTarget prune evicts a segment AVPlayer will need
+        //     later) still trigger a restart after the wait times out.
         let range = cache.indexRange()
         let needsRestart: Bool
         if let r = range {
@@ -1937,9 +1943,11 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
             } else if index > r.1 + Self.forwardWaitWindow {
                 needsRestart = true
             } else if index >= r.0 && index <= r.1 {
-                // Hole: peek already returned nil at the top of this
-                // function, so the only way we land in [r.0..r.1] is
-                // if the slot was pruned out from under a fresh fetch.
+                // Producer might still be writing this index forward
+                // from its current write head. Wait briefly first.
+                if let waited = cache.fetch(index: index, timeout: 2.0) {
+                    return logServed(index: index, bytes: waited, totalStart: totalStart, restarted: false)
+                }
                 needsRestart = true
             } else {
                 // r.1 < index <= r.1 + forwardWaitWindow — producer is
