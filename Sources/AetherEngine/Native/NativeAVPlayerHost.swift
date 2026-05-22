@@ -205,6 +205,7 @@ final class NativeAVPlayerHost {
                 // loaded asset.
                 Self.dumpPlayerItemTracks(item, sid: sid)
                 Self.dumpAudioRoute(sid: sid)
+                Self.warnIfFLACSurroundExceedsRoute(item, sid: sid)
             }
 
             Task { @MainActor in
@@ -544,6 +545,64 @@ final class NativeAVPlayerHost {
                 category: .engine
             )
         }
+    }
+
+    /// One-line warning when the FLAC bridge has produced an N-channel
+    /// track but the active audio route can only carry M < N channels
+    /// of LPCM. Fires only for FLAC tracks because:
+    ///
+    ///   - Stream-copy paths (EAC3 / AC3 / AAC) tunnel through HDMI as
+    ///     encoded bitstream, bypassing the LPCM channel-count limit.
+    ///     A Sonos Arc with route.ch=2 still receives 7.1 surround via
+    ///     EAC3 bitstream over eARC.
+    ///   - FLAC bridge output is decoded to LPCM by AVPlayer, then
+    ///     routed via the active port's LPCM channel count. If the
+    ///     port can carry only stereo (e.g. Sonos Arc reports 2ch
+    ///     LPCM via HDMI even with eARC, because the soundbar handles
+    ///     multichannel exclusively via bitstream), the 8-channel
+    ///     LPCM gets downmixed before reaching the sink. End result:
+    ///     stereo from a TrueHD / DTS-HD MA source.
+    ///
+    /// This is a route capability mismatch, not a bug in the bridge.
+    /// AVR setups with proper 7.1 LPCM-over-HDMI support (Denon /
+    /// Marantz / NAD) carry the full 7.1 LPCM cleanly and don't
+    /// trigger this warning.
+    private static func warnIfFLACSurroundExceedsRoute(_ item: AVPlayerItem, sid: Int) {
+        #if os(iOS) || os(tvOS)
+        var trackChannels: Int = 0
+        var isFLAC = false
+        for itemTrack in item.tracks {
+            guard let assetTrack = itemTrack.assetTrack else { continue }
+            guard assetTrack.mediaType == .audio else { continue }
+            guard let fmt = assetTrack.formatDescriptions.first else { continue }
+            let cm = fmt as! CMFormatDescription
+            let codec = fourccString(CMFormatDescriptionGetMediaSubType(cm))
+            if codec.lowercased() == "flac" {
+                isFLAC = true
+                if let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(cm) {
+                    trackChannels = Int(asbdPtr.pointee.mChannelsPerFrame)
+                }
+                break
+            }
+        }
+        guard isFLAC, trackChannels > 2 else { return }
+        let session = AVAudioSession.sharedInstance()
+        let routeChannels = max(
+            session.currentRoute.outputs.first?.channels?.count ?? 0,
+            session.outputNumberOfChannels
+        )
+        guard routeChannels > 0, routeChannels < trackChannels else { return }
+        EngineLog.emit(
+            "[NativeAVPlayerHost] #\(sid) WARNING: FLAC bridge produced \(trackChannels)-channel "
+            + "LPCM but active audio route carries only \(routeChannels) LPCM channels — tvOS "
+            + "will downmix. Common cause: soundbars (Sonos Arc, etc.) accept multichannel only "
+            + "via bitstream codecs (EAC3, Atmos, DD+), not LPCM. Stream-copy paths bypass this; "
+            + "TrueHD / DTS-HD MA sources route through the FLAC bridge and hit the LPCM limit. "
+            + "AVRs with 7.1 LPCM-over-HDMI support play these sources at full source channel "
+            + "count without downmix.",
+            category: .session
+        )
+        #endif
     }
 
     /// Dump the active audio route's channel capability after the
