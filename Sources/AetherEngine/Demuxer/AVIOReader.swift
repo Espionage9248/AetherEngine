@@ -74,31 +74,40 @@ final class AVIOReader: @unchecked Sendable {
 
     // MARK: - Seekable Mode (Range requests)
 
-    /// Settled chunk size: 64 MB.
+    /// Settled chunk size: 8 MB.
     ///
-    /// A/B history during the long-form leak investigation:
+    /// Re-tuned 2026-05-22 from the historic 64 MB. The original 64 MB
+    /// was a leak-mitigation co-fix during the long-form leak chase:
     ///   8 MB chunks  → 3.20 MB/s leak (URLSession-call-count dominated)
-    ///   64 MB chunks → 0.64 MB/s leak (5x reduction; sweet spot)
-    ///   256 MB chunks → 4.85 MB/s leak + memory warnings (worse than 8 MB)
+    ///   64 MB chunks → 0.64 MB/s leak (5x reduction at the time)
+    ///   256 MB chunks → 4.85 MB/s leak + memory warnings
     ///
-    /// The 256 MB attempt was worst-of-both: each chunk fetch takes
-    /// ~40s at 50 Mbps source bitrate, which gave the prefetch closure
-    /// a long window to be in flight when the demuxer was torn down
-    /// and recreated by the (now-removed) periodic recycle. The
-    /// underlying URLSession's async `finishTasksAndInvalidate` then
-    /// stayed alive with the 256 MB response body pinned. At 64 MB
-    /// the fetch completes in ~10s and the close-vs-prefetch race
-    /// from the historic recycle pattern would be rare.
+    /// But that A/B was run while the (now-removed) periodic demuxer
+    /// recycle was active. The actual leak source was the recycle's
+    /// swap leaking the previous AVIOReader's buffers via a Swift
+    /// refcount path (closed in 1ee963d); chunk size was a side-
+    /// mitigation that reduced the prefetch-race window. Once the
+    /// recycle was removed the leak rate is bounded regardless of
+    /// chunk size by the per-request URLSession + force-copy fix.
     ///
-    /// The periodic recycle is gone now (commit 1ee963d, which was
-    /// the real leak source — the recycle's swap was leaking the
-    /// previous AVIOReader's buffers via a Swift refcount path), so
-    /// the prefetch race no longer happens in normal operation. The
-    /// chunk size + close-cleanup + race-guard fixes from the
-    /// investigation are kept anyway: cheap to retain, defensive
-    /// against any future code path that would teardown an AVIOReader
-    /// with a prefetch in flight.
-    private static let chunkSize = 64 * 1024 * 1024  // 64 MB per chunk
+    /// Trade-off at 8 MB versus 64 MB:
+    ///   - Cold-start: 4K HEVC at 80 Mbps takes ~0.8 s to fetch the
+    ///     first chunk versus ~6.4 s at 64 MB. AVPlayer ready ~6 s
+    ///     sooner from a cold load.
+    ///   - Steady-state: 1.25 URLSession ops/sec at 80 Mbps versus
+    ///     0.16 ops/sec at 64 MB. Modern URLSession handles 100+
+    ///     ops/sec comfortably; per-fetch latency is hidden by the
+    ///     prefetch closure that runs the next chunk in parallel.
+    ///   - Per-request URLSession TCP/TLS handshake (~50-100 ms on
+    ///     remote CDN, near-zero on LAN): ~12% of throughput at the
+    ///     worst case (80 Mbps remote). Acceptable; bandwidth-bound
+    ///     setups are bandwidth-bound regardless of chunk size.
+    ///
+    /// Other defensive fixes from the leak investigation (close-
+    /// cleanup, race-guard in the prefetch closure) stay in place —
+    /// cheap to retain, robust against any future teardown-with-
+    /// prefetch-in-flight code path.
+    private static let chunkSize = 8 * 1024 * 1024  // 8 MB per chunk
     private static let avioBufferSize: Int32 = 256 * 1024  // 256 KB
     private static let streamTrimThreshold = 1024 * 1024  // 1 MB, keep for small backward seeks
 
@@ -673,10 +682,10 @@ final class AVIOReader: @unchecked Sendable {
         // is exactly that pattern: libmalloc tracks each pool slot, the
         // contents change but the slot count stays small.
         //
-        // The chunkSize back to 8 MB stays. With force-copy in place
-        // the per-chunk overhead is one 8 MB memcpy per fetch, which is
-        // negligible at 4K HEVC bitrates (~3 chunks/s = 24 MB/s copy
-        // bandwidth, far under any L1/L2 ceiling).
+        // At the current 8 MB chunkSize, the per-chunk overhead is
+        // one 8 MB memcpy per fetch — negligible at 4K HEVC bitrates
+        // (~1-3 chunks/s = 8-24 MB/s copy bandwidth, far under any
+        // L1/L2 ceiling).
         let session = URLSession(configuration: Self.makeSessionConfig())
         defer { session.finishTasksAndInvalidate() }
 
