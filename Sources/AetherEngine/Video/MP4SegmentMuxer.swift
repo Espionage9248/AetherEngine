@@ -24,12 +24,7 @@ import Libavutil
 /// configured as a plain `mp4` muxer (not `hls` wrapper) with these
 /// movflags:
 ///
-///   +empty_moov         — moov written immediately (no per-sample
-///                          data in the moov; that lives in the
-///                          moof+mdat fragments). Combined with
-///                          +delay_moov the effective behaviour is
-///                          "defer to first packet, then write a
-///                          fragmented moov."
+///   +empty_moov         — moov written eagerly at write_header
 ///   +default_base_moof  — relative offsets in tfhd (cleaner fmp4)
 ///   +frag_custom        — caller controls fragment cuts via
 ///                          `av_write_frame(ctx, nil)`. The mp4
@@ -37,25 +32,12 @@ import Libavutil
 ///                          packets until cut time, naturally
 ///                          aligning audio + video at fragment
 ///                          boundaries.
-///   +delay_moov         — defer moov writing until the first packet
-///                          has been processed, so the mov muxer can
-///                          derive codec sample-entries (dec3 for
-///                          EAC3, dac3 for AC3) from packet bitstream
-///                          when the source codecpar's extradata is
-///                          missing. Required for stream-copying
-///                          EAC3 / AC3 muxed in matroska, where
-///                          CodecPrivate typically omits the dec3
-///                          info. Earlier comments claimed this flag
-///                          caused the long-form 4K HDR HEVC memory
-///                          leak — that turned out to be wrong; the
-///                          actual leak source was the periodic
-///                          demuxer recycle (removed in 1ee963d), not
-///                          the movflags.
 ///
-///   (notably NOT: +dash, +frag_keyframe — +dash adds a session-long
-///   sidx accumulator across fragments that would re-introduce a
-///   different leak; +frag_keyframe would interfere with our explicit
-///   fragment-cut control.)
+///   (notably NOT: +delay_moov, +dash, +frag_keyframe — these were
+///   the leak source. Without +delay_moov the moov is written upfront
+///   empty. Without +dash there's no sidx accumulator across
+///   fragments. mfra at trailer is tiny per-fragment metadata; the
+///   FragmentSplitter discards it.)
 ///
 /// Output flow per session:
 ///
@@ -304,34 +286,14 @@ final class MP4SegmentMuxer {
             audioStream.pointee.time_base = audio.timeBase
         }
 
-        // Movflags. +frag_custom puts fragment cuts under explicit
-        // caller control via av_write_frame(ctx, nil); the mp4 muxer's
-        // interleave queue holds packets between cuts so audio + video
-        // align at fragment boundaries on its own.
-        //
-        // +delay_moov defers the moov atom until the first packet has
-        // been written. This lets the mp4 muxer derive codec-specific
-        // sample-entry boxes (dec3 for EAC3, dac3 for AC3) from the
-        // bitstream when the source codecpar's extradata is missing —
-        // the canonical case being EAC3 / AC3 muxed in matroska, where
-        // CodecPrivate typically omits the pre-parsed bitstream info
-        // the mov muxer would otherwise need at write_header time.
-        // Pre-fix the muxer returned -22 with "Cannot write moov atom
-        // before EAC3 packets parsed" on these sources, the cascade
-        // probe caught it, and the FLAC bridge took over — losing
-        // stream-copy advantages (and Atmos object metadata where
-        // present) for no reason. Adding delay_moov unblocks
-        // stream-copy for AC3 / EAC3 / EAC3-JOC sources that
-        // previously got force-bridged.
-        //
-        // The class docstring used to warn that delay_moov was a leak
-        // source — that turned out to be wrong; the long-form leak we
-        // chased to delay_moov was actually the periodic demuxer
-        // recycle (removed in 1ee963d), not the movflags. delay_moov
-        // is safe.
+        // Movflags: the leak-free trio. See class docstring.
+        // +frag_custom puts fragment cuts under explicit caller control
+        // via av_write_frame(ctx, nil); the mp4 muxer's interleave
+        // queue holds packets between cuts so audio + video align at
+        // fragment boundaries on its own.
         var opts: OpaquePointer? = nil
         defer { av_dict_free(&opts) }
-        av_dict_set(&opts, "movflags", "+empty_moov+default_base_moof+frag_custom+delay_moov", 0)
+        av_dict_set(&opts, "movflags", "+empty_moov+default_base_moof+frag_custom", 0)
         _ = targetSegmentDurationSeconds  // currently unused — frag_custom drives cuts
 
         let ret = avformat_write_header(ctx, &opts)
@@ -454,9 +416,7 @@ final class MP4SegmentMuxer {
 
         var opts: OpaquePointer? = nil
         defer { av_dict_free(&opts) }
-        // Mirror the production muxer's movflags so the probe result
-        // matches what would actually happen at session start.
-        av_dict_set(&opts, "movflags", "+empty_moov+default_base_moof+frag_custom+delay_moov", 0)
+        av_dict_set(&opts, "movflags", "+empty_moov+default_base_moof+frag_custom", 0)
 
         return avformat_write_header(ctx, &opts)
     }
