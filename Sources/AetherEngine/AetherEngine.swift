@@ -2138,17 +2138,25 @@ public final class AetherEngine: ObservableObject {
 
     private nonisolated static func detectVideoFormat(stream: UnsafeMutablePointer<AVStream>) -> VideoFormat {
         let codecpar = stream.pointee.codecpar.pointee
+        // Dolby Vision side-data (the `dvcC` / `dvvC` box parsed out of
+        // the container) is the authoritative DV marker, independent of
+        // base-layer transfer characteristic. Profile 5 is non-backward-
+        // compatible (no HDR10/HLG base; ships with SMPTE2084 OR an
+        // unspecified trc depending on muxer); Profile 7 and 8.1 use
+        // SMPTE2084 base; Profile 8.4 uses HLG base. Branching on
+        // `color_trc` first mis-classifies the HLG-base case (P8.4
+        // reported as plain HLG) and any unspecified-trc case (P5 with
+        // an empty base-layer VUI reported as SDR) — both surface as
+        // criteria writes with `codec=hvc1` instead of `dvh1`, so the
+        // panel never enters DV mode even when it could. DrHurt#4
+        // (2026-05-26): on a DV-capable panel, only P8.1 was producing
+        // `format=dolbyvision codec=dvh1` pre-fix.
+        if Self.streamHasDV(stream: stream) {
+            return .dolbyVision
+        }
         let transfer = codecpar.color_trc
-        // PQ + DV side data → dolbyVision; PQ alone → hdr10. HLG → hlg.
-        // Everything else → sdr. Per-stream HDR10+ T.35 SEI detection
-        // happens inside HLSVideoEngine; this probe is the coarse
-        // gate for the display-criteria handshake.
-        if transfer == AVCOL_TRC_SMPTE2084 {
-            return Self.streamHasDV(stream: stream) ? .dolbyVision : .hdr10
-        }
-        if transfer == AVCOL_TRC_ARIB_STD_B67 {
-            return .hlg
-        }
+        if transfer == AVCOL_TRC_SMPTE2084 { return .hdr10 }
+        if transfer == AVCOL_TRC_ARIB_STD_B67 { return .hlg }
         return .sdr
     }
 
@@ -2171,10 +2179,11 @@ public final class AetherEngine: ObservableObject {
         if trc == AVCOL_TRC_ARIB_STD_B67 {
             return caps.supportsHLG ? .hlg : .sdr
         }
-        if trc == AVCOL_TRC_SMPTE2084 {
-            return caps.supportsHDR10 ? .hdr10 : .sdr
-        }
-        return .sdr
+        // SMPTE2084 base (P5 / P7 / P8.1) or an unspecified trc (P5
+        // sometimes ships with an empty base-layer VUI). Both are
+        // HDR-derived; AVPlayer tonemaps via the dvh1 sample entry on
+        // a non-DV panel. Map to HDR10 if the panel can present it.
+        return caps.supportsHDR10 ? .hdr10 : .sdr
     }
 
     /// Called (once per session) when either backend's HDR10+ scan
