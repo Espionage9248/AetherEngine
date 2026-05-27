@@ -105,11 +105,13 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
+          # No --keychain flag: notarytool writes to whatever
+          # `security default-keychain` points at, which the prior step
+          # set to our disposable CI keychain.
           xcrun notarytool store-credentials AETHER_NOTARY \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
-            --password "$APPLE_APP_PASSWORD" \
-            --keychain "$KEYCHAIN"
+            --password "$APPLE_APP_PASSWORD"
 
       - name: Build + notarize + package
         env:
