@@ -28,6 +28,13 @@ final class FrameDecodeContext: @unchecked Sendable {
     private var videoStreamIndex: Int32 = -1
     private var timeBase = AVRational(num: 1, den: 90000)
     private(set) var isOpen = false
+    private(set) var isHDR = false
+
+    /// PQ (ST 2084) and HLG transfers mean the decoded frame is HDR and
+    /// needs tone-mapping to SDR before display as a thumbnail.
+    static func isHDRTransfer(_ trc: AVColorTransferCharacteristic) -> Bool {
+        return trc == AVCOL_TRC_SMPTE2084 || trc == AVCOL_TRC_ARIB_STD_B67
+    }
 
     init(url: URL, httpHeaders: [String: String]) {
         self.url = url
@@ -63,6 +70,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         demuxer?.close()
         demuxer = nil
         videoStreamIndex = -1
+        isHDR = false
         isOpen = false
     }
 
@@ -83,6 +91,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         guard let codecpar = stream.pointee.codecpar else {
             throw FrameDecodeError.noCodecParameters
         }
+        isHDR = Self.isHDRTransfer(codecpar.pointee.color_trc)
         guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
             throw FrameDecodeError.unsupportedCodec
         }
@@ -214,6 +223,14 @@ final class FrameDecodeContext: @unchecked Sendable {
                 let width = mode == .thumbnail
                     ? targetWidth
                     : Self.clampedWidth(frame: f, maxSize: maxSize)
+                if isHDR {
+                    var toned = HDRToneMapper.toneMap(frame: f, targetWidth: width, timeBase: timeBase)
+                    if toned != nil {
+                        defer { av_frame_free(&toned) }
+                        if let img = Self.cgImageFromRGBAFrame(toned!) { return img }
+                    }
+                    // tone-map failed: fall through to the sws path (degraded but non-nil)
+                }
                 return convertToCGImage(frame: f, targetWidth: width)
             }
         }
@@ -229,6 +246,32 @@ final class FrameDecodeContext: @unchecked Sendable {
         }
         let scale = min(maxSize.width / CGFloat(nativeW), maxSize.height / CGFloat(nativeH), 1.0)
         return max(1, Int((CGFloat(nativeW) * scale).rounded()))
+    }
+
+    /// Wrap an RGBA AVFrame (e.g. the tone-mapper output) into a CGImage by
+    /// copying its pixels into an owned buffer. Honors linesize (row stride
+    /// may exceed width*4).
+    private static func cgImageFromRGBAFrame(_ frame: UnsafeMutablePointer<AVFrame>) -> CGImage? {
+        let w = Int(frame.pointee.width)
+        let h = Int(frame.pointee.height)
+        guard w > 0, h > 0, let src = frame.pointee.data.0 else { return nil }
+        let srcStride = Int(frame.pointee.linesize.0)
+        let dstStride = w * 4
+        var rgba = [UInt8](repeating: 0, count: dstStride * h)
+        rgba.withUnsafeMutableBytes { dst in
+            for row in 0..<h {
+                memcpy(dst.baseAddress!.advanced(by: row * dstStride),
+                       src.advanced(by: row * srcStride),
+                       dstStride)
+            }
+        }
+        let data = Data(rgba)
+        guard let provider = CGDataProvider(data: data as CFData),
+              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue)
+        return CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: dstStride, space: colorSpace, bitmapInfo: bitmapInfo,
+                       provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
     }
 
     /// sws_scale the frame to RGBA at `targetWidth` (height derived from
