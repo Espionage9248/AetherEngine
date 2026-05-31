@@ -106,6 +106,10 @@ final class FrameDecodeContext: @unchecked Sendable {
         ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
 
         var opts: OpaquePointer?
+        // Software decode is actually forced by the get_format callback
+        // above (it rejects AV_PIX_FMT_VIDEOTOOLBOX). The "hwaccel" dict
+        // entry is a no-op at avcodec_open2 level but is kept for parity
+        // with SoftwareVideoDecoder.
         av_dict_set(&opts, "hwaccel", "none", 0)
         guard avcodec_open2(ctx, codec, &opts) >= 0 else {
             av_dict_free(&opts)
@@ -182,6 +186,10 @@ final class FrameDecodeContext: @unchecked Sendable {
                 if recvRet == AVERROR_FRAMEDECODE_EOF_VALUE { return nil } // decoder drained
                 guard recvRet >= 0, let f = frame else { break }       // real error: try next packet
 
+                // Skip frames before the requested PTS for frame-accuracy.
+                // A frame with no PTS (AV_NOPTS_VALUE == Int64.min) is
+                // accepted as-is, so on PTS-less streams snapshot degrades
+                // gracefully to the first frame after the seek.
                 if mode == .snapshot,
                    f.pointee.pts != Int64.min,
                    f.pointee.pts < targetPTS {
