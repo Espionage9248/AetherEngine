@@ -6,6 +6,12 @@ import Libavcodec
 import Libavutil
 import Libswscale
 
+/// avcodec_receive_frame "needs more input" sentinel. AVERROR(EAGAIN);
+/// the EAGAIN errno is 35 on Darwin and FFmpeg negates it.
+private let AVERROR_EAGAIN_VALUE: Int32 = -35
+/// FFmpeg AVERROR_EOF: FFERRTAG(0xF8,'E','O','F') = -541478725.
+private let AVERROR_FRAMEDECODE_EOF_VALUE: Int32 = -541478725
+
 /// Isolated, single-threaded FFmpeg decode context for still-image
 /// extraction. Owns its own `Demuxer`, `AVCodecContext` (forced
 /// software), and `SwsContext`, strictly separate from playback. Lazy:
@@ -107,7 +113,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         }
         av_dict_free(&opts)
 
-        EngineLog.emit("[FrameDecode] Opened \(codecpar.pointee.width)x\(codecpar.pointee.height) codec=\(String(cString: codec.pointee.name))", category: .swPlayback)
+        EngineLog.emit("[FrameDecode] Opened \(codecpar.pointee.width)x\(codecpar.pointee.height) codec=\(String(cString: codec.pointee.name)) threads=\(ctx.pointee.thread_count)", category: .swPlayback)
     }
 
     // MARK: - Decode
@@ -136,6 +142,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         avcodec_flush_buffers(ctx)
         demuxer.seek(to: seconds)
 
+        guard timeBase.num > 0 else { return nil }
         let targetPTS = Int64((seconds * Double(timeBase.den)) / Double(timeBase.num))
 
         var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
@@ -161,6 +168,8 @@ final class FrameDecodeContext: @unchecked Sendable {
                 continue
             }
 
+            // The receive loop below drains the decoder before each send,
+            // so the decoder's input queue is always empty here; send-side EAGAIN cannot occur.
             let sendRet = avcodec_send_packet(ctx, packet)
             av_packet_unref(packet)
             av_packet_free_safe(packet)
@@ -169,7 +178,9 @@ final class FrameDecodeContext: @unchecked Sendable {
             while true {
                 if isCancelled() { return nil }
                 let recvRet = avcodec_receive_frame(ctx, frame)
-                guard recvRet >= 0, let f = frame else { break }
+                if recvRet == AVERROR_EAGAIN_VALUE { break }           // need another packet
+                if recvRet == AVERROR_FRAMEDECODE_EOF_VALUE { return nil } // decoder drained
+                guard recvRet >= 0, let f = frame else { break }       // real error: try next packet
 
                 if mode == .snapshot,
                    f.pointee.pts != Int64.min,
@@ -259,7 +270,9 @@ final class FrameDecodeContext: @unchecked Sendable {
               let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
             return nil
         }
-        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        // sws_scale into RGBA yields straight, fully-opaque pixels (alpha
+        // = 0xFF), so the alpha byte is ignorable rather than premultiplied.
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue)
         return CGImage(
             width: dstW, height: dstH,
             bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: bytesPerRow,
