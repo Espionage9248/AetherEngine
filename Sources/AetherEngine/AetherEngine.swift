@@ -778,6 +778,39 @@ public final class AetherEngine: ObservableObject {
         let snappedRate = FrameRateSnap.snap(detectedRate ?? 0)
         EngineLog.emit("[AetherEngine] load url=\(url.absoluteString) source-format=\(detectedFormat) effective-format=\(effectiveFormat) rate=\(snappedRate.map { String(format: "%.3f", $0) } ?? "n/a")", category: .engine)
 
+        // 1.5 Audio-only fast path. When the host asked for audio-only
+        //     or the probe found no video stream, route to the lean
+        //     AudioPlaybackHost and return before the display-criteria
+        //     handshake and the video dispatch below ever run. The probe
+        //     opened its own AVFormatContext; close it since the audio
+        //     host opens its own Demuxer.
+        let hasVideoStream = probeOpened && probe.videoStreamIndex >= 0
+        if Self.shouldUseAudioOnlyPath(audioOnlyRequested: options.audioOnly, hasVideoStream: hasVideoStream) {
+            if probeOpened { probe.close() }
+            do {
+                try await loadAudio(
+                    url: url,
+                    sourceHTTPHeaders: options.httpHeaders,
+                    startPosition: startPosition,
+                    audioSourceStreamIndex: resolvedInitialAudio >= 0 ? resolvedInitialAudio : nil
+                )
+                playbackBackend = .audio
+                activeVideoDecoder = nil
+                activeAudioDecoder = Self.softwareAudioDecoderLabel(
+                    audioTracks: probedAudioTracks,
+                    activeIndex: resolvedInitialAudio
+                )
+                videoFormat = .sdr
+                audioHost?.play()
+                state = .playing
+                startMemoryProbe()
+            } catch {
+                state = .error("Failed to load: \(error.localizedDescription)")
+                throw error
+            }
+            return
+        }
+
         // 2. Display-criteria handshake. Drive from the effective format so
         //    a non-DV panel doesn't get asked to switch into dvh1 mode.
         if !options.suppressDisplayCriteria {
