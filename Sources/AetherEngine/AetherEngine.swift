@@ -279,6 +279,12 @@ public final class AetherEngine: ObservableObject {
     /// the engine's own surface. Cleared on stopInternal.
     private var audioCancellables = Set<AnyCancellable>()
 
+    /// Native AVPlayer audio host. Non-nil only while an audio-only session
+    /// whose codec AVPlayer can decode natively is active. Mutually
+    /// exclusive with the other hosts.
+    private var audioAVPlayerHost: AudioAVPlayerHost?
+    private var audioNativeCancellables = Set<AnyCancellable>()
+
     /// Periodic memory diagnostic. Emits the process's resident memory
     /// footprint and engine-internal counters every 30 s so we can
     /// see growth patterns instead of guessing about leaks. Started in
@@ -786,24 +792,42 @@ public final class AetherEngine: ObservableObject {
         //     host opens its own Demuxer.
         let hasVideoStream = probeOpened && probe.videoStreamIndex >= 0
         if Self.shouldUseAudioOnlyPath(audioOnlyRequested: options.audioOnly, hasVideoStream: hasVideoStream) {
+            // Read the chosen audio stream's codec before closing the probe
+            // so AVPlayer-decodable audio takes the native path.
+            let audioCodecID: AVCodecID = (probeOpened && resolvedInitialAudio >= 0)
+                ? (probe.stream(at: resolvedInitialAudio)?.pointee.codecpar.pointee.codec_id ?? AV_CODEC_ID_NONE)
+                : AV_CODEC_ID_NONE
             if probeOpened { probe.close() }
+            let useNativeAudio = Self.avPlayerCanDecodeAudio(audioCodecID)
+            EngineLog.emit("[AetherEngine] audio dispatch: codec=\(audioCodecID.rawValue) -> \(useNativeAudio ? "AVPlayer" : "FFmpeg")", category: .engine)
             do {
-                try await loadAudio(
-                    url: url,
-                    sourceHTTPHeaders: options.httpHeaders,
-                    startPosition: startPosition,
-                    audioSourceStreamIndex: resolvedInitialAudio >= 0 ? resolvedInitialAudio : nil
-                )
-                playbackBackend = .audio
-                activeVideoDecoder = nil
-                activeAudioDecoder = Self.softwareAudioDecoderLabel(
-                    audioTracks: probedAudioTracks,
-                    activeIndex: resolvedInitialAudio
-                )
-                videoFormat = .sdr
-                audioHost?.play()
-                state = .playing
-                startMemoryProbe()
+                if useNativeAudio {
+                    try await loadAudioNative(url: url, startPosition: startPosition, httpHeaders: options.httpHeaders)
+                    playbackBackend = .audio
+                    activeVideoDecoder = nil
+                    activeAudioDecoder = "AVPlayer"
+                    videoFormat = .sdr
+                    audioAVPlayerHost?.play()
+                    state = .playing
+                    startMemoryProbe()
+                } else {
+                    try await loadAudio(
+                        url: url,
+                        sourceHTTPHeaders: options.httpHeaders,
+                        startPosition: startPosition,
+                        audioSourceStreamIndex: resolvedInitialAudio >= 0 ? resolvedInitialAudio : nil
+                    )
+                    playbackBackend = .audio
+                    activeVideoDecoder = nil
+                    activeAudioDecoder = Self.softwareAudioDecoderLabel(
+                        audioTracks: probedAudioTracks,
+                        activeIndex: resolvedInitialAudio
+                    )
+                    videoFormat = .sdr
+                    audioHost?.play()
+                    state = .playing
+                    startMemoryProbe()
+                }
             } catch {
                 state = .error("Failed to load: \(error.localizedDescription)")
                 throw error
@@ -1262,10 +1286,63 @@ public final class AetherEngine: ObservableObject {
         }.value
     }
 
+    /// Open an `AudioAVPlayerHost` against an audio-only source AVPlayer can
+    /// decode natively, and wire its @Published mirror into the engine's
+    /// surface. The native, energy-efficient default for audio-only; the
+    /// FFmpeg `loadAudio` path is the fallback for codecs AVPlayer cannot
+    /// decode. Same lifecycle shape as loadAudio.
+    private func loadAudioNative(
+        url: URL,
+        startPosition: Double?,
+        httpHeaders: [String: String]
+    ) async throws {
+        let host = AudioAVPlayerHost()
+        self.audioAVPlayerHost = host
+        self.playlistShiftSeconds = 0
+
+        audioNativeCancellables.removeAll()
+        host.$currentTime
+            .sink { [weak self] value in
+                guard let self = self else { return }
+                self.currentTime = value
+                self.sourceTime = value
+            }
+            .store(in: &audioNativeCancellables)
+        host.$duration
+            .sink { [weak self] value in
+                if value > 0 { self?.duration = value }
+            }
+            .store(in: &audioNativeCancellables)
+        host.$isReady
+            .sink { [weak self] ready in
+                guard let self = self else { return }
+                if ready, self.state == .loading {
+                    self.state = .paused
+                }
+            }
+            .store(in: &audioNativeCancellables)
+        host.$failureMessage
+            .compactMap { $0 }
+            .sink { [weak self] msg in self?.state = .error(msg) }
+            .store(in: &audioNativeCancellables)
+        host.$didReachEnd
+            .filter { $0 }
+            .sink { [weak self] _ in
+                self?.state = .idle
+            }
+            .store(in: &audioNativeCancellables)
+
+        try await Task.detached(priority: .userInitiated) { [host] in
+            try await host.load(url: url, startPosition: startPosition, httpHeaders: httpHeaders)
+        }.value
+    }
+
     // MARK: - Transport
 
     public func play() {
-        if let host = audioHost {
+        if let host = audioAVPlayerHost {
+            host.play()
+        } else if let host = audioHost {
             host.play()
         } else if let host = softwareHost {
             host.play()
@@ -1278,7 +1355,9 @@ public final class AetherEngine: ObservableObject {
     }
 
     public func pause() {
-        if let host = audioHost {
+        if let host = audioAVPlayerHost {
+            host.pause()
+        } else if let host = audioHost {
             host.pause()
         } else if let host = softwareHost {
             host.pause()
@@ -1308,7 +1387,11 @@ public final class AetherEngine: ObservableObject {
         // has no AVPlayer and no competing transport owner, so its `state`
         // is authoritative.
         let isPlaying: Bool
-        if audioHost != nil {
+        if audioAVPlayerHost != nil {
+            // Audio host has no competing transport owner, so `state` is
+            // authoritative (same reasoning as the software host).
+            isPlaying = (state == .playing)
+        } else if audioHost != nil {
             // Audio host has no competing transport owner, so `state` is
             // authoritative (same reasoning as the software host).
             isPlaying = (state == .playing)
@@ -1343,7 +1426,9 @@ public final class AetherEngine: ObservableObject {
         }
         let target = max(0, min(seconds, duration))
         state = .seeking
-        if let host = audioHost {
+        if let host = audioAVPlayerHost {
+            await host.seek(to: target)
+        } else if let host = audioHost {
             await host.seek(to: target)
         } else if let host = softwareHost {
             await host.seek(to: target)
@@ -1417,8 +1502,9 @@ public final class AetherEngine: ObservableObject {
 
     /// Set playback volume (0.0 = mute, 1.0 = full).
     public var volume: Float {
-        get { audioHost?.volume ?? softwareHost?.volume ?? nativeHost?.avPlayer.volume ?? 1.0 }
+        get { audioAVPlayerHost?.volume ?? audioHost?.volume ?? softwareHost?.volume ?? nativeHost?.avPlayer.volume ?? 1.0 }
         set {
+            audioAVPlayerHost?.volume = newValue
             audioHost?.volume = newValue
             softwareHost?.volume = newValue
             nativeHost?.avPlayer.volume = newValue
@@ -1430,7 +1516,9 @@ public final class AetherEngine: ObservableObject {
     /// rate goes through the synchronizer and audio plays at the
     /// changed rate without pitch correction.
     public func setRate(_ rate: Float) {
-        if let host = audioHost {
+        if let host = audioAVPlayerHost {
+            host.setRate(rate)
+        } else if let host = audioHost {
             host.setRate(rate)
         } else if let host = softwareHost {
             host.setRate(rate)
@@ -2073,6 +2161,10 @@ public final class AetherEngine: ObservableObject {
         audioCancellables.removeAll()
         audioHost?.stop()
         audioHost = nil
+
+        audioNativeCancellables.removeAll()
+        audioAVPlayerHost?.stop()
+        audioAVPlayerHost = nil
 
         if resetDisplayCriteria {
             displayCriteria.reset()
