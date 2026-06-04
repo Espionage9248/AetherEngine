@@ -269,6 +269,16 @@ public final class AetherEngine: ObservableObject {
     /// Cancelled on stopInternal alongside `nativeCancellables`.
     private var softwareCancellables: Set<AnyCancellable> = []
 
+    /// The lean audio-only playback host. Non-nil only while an
+    /// audio-only session (music) is active. Mutually exclusive with
+    /// `nativeHost` / `softwareHost`: a load tears all of them down via
+    /// `stopInternal` before bringing one up.
+    private var audioHost: AudioPlaybackHost?
+
+    /// Combine subscriptions from `audioHost`'s @Published mirrors into
+    /// the engine's own surface. Cleared on stopInternal.
+    private var audioCancellables = Set<AnyCancellable>()
+
     /// Periodic memory diagnostic. Emits the process's resident memory
     /// footprint and engine-internal counters every 30 s so we can
     /// see growth patterns instead of guessing about leaks. Started in
@@ -1150,6 +1160,65 @@ public final class AetherEngine: ObservableObject {
         // `async` signature — a @MainActor caller awaiting it doesn't
         // yield to the runloop). Mirrors the same pattern applied to
         // the probe and to `session.start()`.
+        try await Task.detached(priority: .userInitiated) { [host] in
+            try await host.load(
+                url: url,
+                sourceHTTPHeaders: sourceHTTPHeaders,
+                startPosition: startPosition,
+                audioSourceStreamIndex: audioSourceStreamIndex
+            )
+        }.value
+    }
+
+    /// Open an `AudioPlaybackHost` against an audio-only source and wire
+    /// its @Published mirror into the engine's surface. The lean path:
+    /// no HLS pipeline, no display layer, no display-criteria handshake.
+    /// Same lifecycle shape as `loadSoftware`.
+    private func loadAudio(
+        url: URL,
+        sourceHTTPHeaders: [String: String] = [:],
+        startPosition: Double?,
+        audioSourceStreamIndex: Int32?
+    ) async throws {
+        let host = AudioPlaybackHost()
+        self.audioHost = host
+        // Audio path tracks source PTS directly: no AVPlayer-clock shift.
+        self.playlistShiftSeconds = 0
+
+        audioCancellables.removeAll()
+        host.$currentTime
+            .sink { [weak self] value in
+                guard let self = self else { return }
+                self.currentTime = value
+                self.sourceTime = value
+            }
+            .store(in: &audioCancellables)
+        host.$duration
+            .sink { [weak self] value in
+                if value > 0 { self?.duration = value }
+            }
+            .store(in: &audioCancellables)
+        host.$isReady
+            .sink { [weak self] ready in
+                guard let self = self else { return }
+                if ready, self.state == .loading {
+                    self.state = .paused
+                }
+            }
+            .store(in: &audioCancellables)
+        host.$failureMessage
+            .compactMap { $0 }
+            .sink { [weak self] msg in self?.state = .error(msg) }
+            .store(in: &audioCancellables)
+        host.$didReachEnd
+            .filter { $0 }
+            .sink { [weak self] _ in
+                self?.state = .idle
+            }
+            .store(in: &audioCancellables)
+
+        // Detach the host's load (its body is synchronous despite the
+        // async signature) so the @MainActor runloop keeps ticking.
         try await Task.detached(priority: .userInitiated) { [host] in
             try await host.load(
                 url: url,
