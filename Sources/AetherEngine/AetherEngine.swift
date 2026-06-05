@@ -1345,29 +1345,19 @@ public final class AetherEngine: ObservableObject {
                 self?.state = .idle
             }
             .store(in: &audioNativeCancellables)
-        host.$timeControlStatus
-            .sink { [weak self] status in
-                guard let self = self else { return }
-                // Reconcile `state` when something other than the engine's
-                // own play()/pause() drives the AVPlayer: Control Center,
-                // the Siri Remote play/pause, or AirPods. Without this our
-                // state goes stale, the now-playing rate stops reflecting
-                // reality, and togglePlayPause() resolves to a no-op
-                // (the "only pause works" symptom). Only reconcile between
-                // the two steady transport states; never clobber loading /
-                // seeking / error / idle. `.waitingToPlayAtSpecifiedRate`
-                // is a buffer stall while the user still intends to play.
-                guard self.state == .playing || self.state == .paused else { return }
-                switch status {
-                case .paused:
-                    if self.state != .paused { self.state = .paused }
-                case .playing, .waitingToPlayAtSpecifiedRate:
-                    if self.state != .playing { self.state = .playing }
-                @unknown default:
-                    break
-                }
-            }
-            .store(in: &audioNativeCancellables)
+        // NOTE: deliberately NO reconciliation of `state` from the host's
+        // `timeControlStatus` on the audio path. All audio transport flows
+        // through the engine's own play()/pause() (driven host-side by
+        // MPRemoteCommandCenter handlers, the in-app .onPlayPauseCommand, and
+        // the queue logic), so those are the single source of truth for
+        // `state`. Feeding timeControlStatus back into `state` mis-latched a
+        // TRANSIENT `.paused` that AVFoundation emits during the app's
+        // background transition as a real pause: the engine flipped to
+        // paused while audio kept playing, the published now-playing rate
+        // went to 0, and tvOS (which reads MPNowPlayingInfoPropertyPlaybackRate
+        // to infer play-vs-pause) then believed we were paused-while-playing,
+        // breaking the system Now-Playing badge and the Siri Remote routing.
+        // timeControlStatus is advisory display state, not a command source.
 
         try await Task.detached(priority: .userInitiated) { [host] in
             try await host.load(url: url, startPosition: startPosition, httpHeaders: httpHeaders)
