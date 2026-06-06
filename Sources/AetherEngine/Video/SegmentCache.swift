@@ -424,7 +424,23 @@ final class SegmentCache {
     /// Must be called with `condition` held.
     private func pruneOutsideWindow() {
         let lo = currentTargetIndex - backwardWindow
-        let hi = currentTargetIndex + forwardWindow
+        // Forward bound: keep forwardWindow ahead of the target, but never
+        // evict segments the current producer already wrote. A transient
+        // backward refetch (AVPlayer re-pulling recent segments for audio
+        // handover or a decode flush) drops currentTargetIndex back for one
+        // request; if the forward bound collapsed to target+forwardWindow it
+        // would evict already-produced forward segments the paused producer
+        // won't backfill, turning the next forward request into a cache-miss
+        // producer restart (re-mux with a fresh init.mp4 -> stall + audible
+        // A/V discontinuity, repro: produce seg0..25, AVPlayer refetches
+        // seg4 so target=4 prunes seg15+, then stalls when it reaches seg15).
+        // Anchoring on _highestStoredIndex keeps produced-but-unconsumed
+        // segments resident through the dip. Bounded: the producer paces
+        // itself to target+forwardWindow, and resetHighWaterForRestart()
+        // drops the high-water to -1 on a real (far-scrub) restart, so this
+        // can only exceed target+forwardWindow transiently during a backward
+        // dip, by at most the dip distance.
+        let hi = max(currentTargetIndex + forwardWindow, _highestStoredIndex)
         for (k, url) in entries {
             if k < lo || k > hi {
                 _totalBytes -= byteSize(of: url)
