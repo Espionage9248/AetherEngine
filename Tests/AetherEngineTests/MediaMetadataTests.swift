@@ -38,6 +38,13 @@ struct MediaMetadataTests {
         #expect(m.artworkData == bytes)
     }
 
+    @Test("Whitespace-only albumArtist does not become artist")
+    func whitespaceAlbumArtistIsNil() {
+        let m = MediaMetadata.from(title: "S", artist: nil, album: nil,
+                                   albumArtist: "   ", artworkData: nil)
+        #expect(m.artist == nil)
+    }
+
     @Test("hasDisplayMetadata is false when all text fields are empty")
     func hasDisplayMetadataFlag() {
         let empty = MediaMetadata.from(title: nil, artist: nil, album: nil,

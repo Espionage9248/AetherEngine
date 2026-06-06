@@ -388,14 +388,15 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
 /// Container-level media metadata (tags + embedded cover art) for the
 /// loaded source. Every field is optional: audio files frequently ship
 /// with partial or no tags, and video files usually have none. Built
-/// from the FFmpeg AVFormatContext via `MediaMetadata.from(...)`, which
-/// applies the album-artist fallback and drops empty strings.
+/// via `MediaMetadata.from(...)`, which applies the album-artist fallback
+/// and drops empty strings.
 public struct MediaMetadata: Sendable, Equatable {
     public let title: String?
     public let artist: String?
     public let album: String?
     /// Embedded cover art bytes exactly as stored in the container
-    /// (JPEG or PNG), or nil when the source has no attached picture.
+    /// (typically JPEG or PNG); no format validation is performed.
+    /// nil when the source has no attached picture.
     public let artworkData: Data?
 
     public init(title: String?, artist: String?, album: String?, artworkData: Data?) {
