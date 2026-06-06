@@ -591,6 +591,20 @@ final class NativeAVPlayerHost {
         }
         notificationObservers.removeAll()
         accessLogCount = 0
+        // Force the player rate to 0 before swapping the item. On a
+        // native->native reload the host (and its AVPlayer) is reused to
+        // keep AVKit's system Now-Playing registration alive (issue #15),
+        // so the instance carries its previous `rate=1.0` across the swap.
+        // Without this pause, `replaceCurrentItem` lets the new item
+        // auto-resume the moment it buffers — which beats the engine's
+        // `waitForSwitch` + explicit `play()` gate (AetherEngine.load step
+        // 3) and starts audio while the panel is still mid Match-Frame-Rate
+        // refresh switch (HDMI output blanked). The result is "audio leads,
+        // video appears a beat later" on episode autoplay. Pausing here
+        // restores the intended gate: the new item stays parked until the
+        // explicit post-handshake `play()`. No-op on a cold load (rate is
+        // already 0).
+        avPlayer.pause()
         avPlayer.replaceCurrentItem(with: nil)
         playerItem = nil
         isReady = false
