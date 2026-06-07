@@ -1462,7 +1462,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     if let prev = pendingVideoPkt {
                         // Determine which segment `prev` belongs to.
                         // VOD: DTS lookup against the precomputed plan
-                        // (DTS, not PTS — HEVC open-GOP CRA emits leading
+                        // (DTS, not PTS, because HEVC open-GOP CRA emits leading
                         // B-frames whose display PTS sits in the previous
                         // segment even though decode order is in the
                         // current one; segment boundaries are IRAP

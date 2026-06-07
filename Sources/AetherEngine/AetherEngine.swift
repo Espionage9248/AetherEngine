@@ -187,12 +187,6 @@ public final class AetherEngine: ObservableObject {
 
     // MARK: - Capabilities
 
-    /// Snapshot of what the active display can present right now.
-    ///
-    /// Reads `AVPlayer.eligibleForHDRPlayback` and
-    /// `AVPlayer.availableHDRModes` at call time. tvOS and iOS report
-    /// panel capabilities; macOS reports the built-in display only and
-    /// may under-report external displays.
     /// TEST-ONLY routing override. When true, `load` forces every source
     /// through `SoftwarePlaybackHost` regardless of codec, so the SW live
     /// + DVR path can be exercised against the H.264 fixture (which would
@@ -209,6 +203,12 @@ public final class AetherEngine: ObservableObject {
         forceSoftwarePathForTesting = on
     }
 
+    /// Snapshot of what the active display can present right now.
+    ///
+    /// Reads `AVPlayer.eligibleForHDRPlayback` and
+    /// `AVPlayer.availableHDRModes` at call time. tvOS and iOS report
+    /// panel capabilities; macOS reports the built-in display only and
+    /// may under-report external displays.
     public static var displayCapabilities: DisplayCapabilities {
         #if os(tvOS) || os(iOS)
         let hdrEligible = AVPlayer.eligibleForHDRPlayback
@@ -1854,7 +1854,7 @@ public final class AetherEngine: ObservableObject {
 
     /// Update the live DVR window from a path's reported edge and publish the
     /// four live surfaces (`liveEdgeTime`, `seekableLiveRange`, `isAtLiveEdge`,
-    /// `behindLiveSeconds`). Path-agnostic: the native tick and (later) the SW
+    /// `behindLiveSeconds`). Path-agnostic: the native tick and the SW
     /// tick both call this with their session-relative edge time. No-op when
     /// no live window is active.
     @MainActor
