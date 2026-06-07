@@ -78,12 +78,18 @@ public final class Demuxer: @unchecked Sendable {
     /// reader issues against `url` (HEAD probe + Range / streaming
     /// GETs). Ignored for `file://` URLs. Pass auth tokens or any
     /// other server-required headers here. Default empty.
-    func open(url: URL, extraHeaders: [String: String] = [:], profile: DemuxerOpenProfile = .playback) throws {
+    ///
+    /// `isLive` marks the source as a genuinely endless live feed and
+    /// is forwarded to `AVIOReader` so it suppresses the
+    /// `position >= fileSize` EOF synthesis and surfaces a terminal
+    /// error when the reconnect cap is hit (instead of collapsing to a
+    /// silent EOF). Has no effect on `file://` sources.
+    func open(url: URL, extraHeaders: [String: String] = [:], profile: DemuxerOpenProfile = .playback, isLive: Bool = false) throws {
         self.openProfile = profile
         let isHTTP = url.scheme == "http" || url.scheme == "https"
 
         if isHTTP {
-            try openHTTP(url: url, extraHeaders: extraHeaders)
+            try openHTTP(url: url, extraHeaders: extraHeaders, isLive: isLive)
         } else {
             try openLocal(url: url)
         }
@@ -124,12 +130,13 @@ public final class Demuxer: @unchecked Sendable {
     }
 
     /// Open an HTTP(S) URL via custom AVIO context + URLSession.
-    private func openHTTP(url: URL, extraHeaders: [String: String]) throws {
+    private func openHTTP(url: URL, extraHeaders: [String: String], isLive: Bool = false) throws {
         let reader = AVIOReader(
             url: url,
             extraHeaders: extraHeaders,
             chunkSize: openProfile.avioChunkSize,
-            prefetchEnabled: openProfile.avioPrefetch
+            prefetchEnabled: openProfile.avioPrefetch,
+            isLive: isLive
         )
         try openWithProvider(reader)
     }

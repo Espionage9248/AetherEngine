@@ -863,7 +863,13 @@ public final class AetherEngine: ObservableObject {
             try await Task.detached(priority: .userInitiated) { [probe, source, options] in
                 switch source {
                 case .url(let u):
-                    try probe.open(url: u, extraHeaders: options.httpHeaders)
+                    // Pass isLive so the probe demuxer's AVIOReader is
+                    // configured for endless-feed mode. The probe demuxer is
+                    // reused as the session demuxer (avformat_open_input +
+                    // avformat_find_stream_info run only once), so the
+                    // AVIOReader it holds must already have isLive=true when
+                    // the producer starts reading from it.
+                    try probe.open(url: u, extraHeaders: options.httpHeaders, isLive: options.isLive)
                 case .custom(let reader, let formatHint):
                     try probe.open(reader: reader, formatHint: formatHint)
                 }
@@ -1490,7 +1496,7 @@ public final class AetherEngine: ObservableObject {
                 dem = pre
             } else {
                 dem = Demuxer()
-                try dem.open(url: url, extraHeaders: sourceHTTPHeaders)
+                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, isLive: isLive)
             }
             try await host.load(
                 demuxer: dem,

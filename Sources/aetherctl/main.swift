@@ -764,7 +764,8 @@ private func runLive(
     measureRSS: Bool,
     reportCacheBytes: Bool,
     rewindTest: Bool = false,
-    forceSoftware: Bool = false
+    forceSoftware: Bool = false,
+    dropAfter: Double? = nil
 ) -> Int32 {
     EngineLog.handler = { print($0) }
 
@@ -781,6 +782,7 @@ private func runLive(
     let resolvedSeed = seedPath ?? "Fixtures/user/h264-ts-sample.ts"
     print("aetherctl live: seed=\(resolvedSeed) seconds=\(playSeconds)" +
           (dvrWindow.map { " dvr-window=\($0)" } ?? " dvr-window=none (live-only floor)") +
+          (dropAfter.map { " drop-after=\($0)s" } ?? "") +
           (measureRSS ? " measure-rss=true" : "") +
           (reportCacheBytes ? " report-cache-bytes=true" : ""))
 
@@ -791,6 +793,7 @@ private func runLive(
         print("ERROR: \(error)")
         return 1
     }
+    fixture.dropAfterSeconds = dropAfter
 
     let liveURL: URL
     do {
@@ -1180,13 +1183,17 @@ if first == "live" {
     // of codec (TEST-ONLY routing override). Lets the H.264 fixture
     // exercise the SW live + DVR path end-to-end.
     let forceSW = takeFlag("--sw", from: &rest)
+    // --drop-after N: instruct LiveFixture to close the first client
+    // connection after N seconds, simulating a single recoverable mid-stream
+    // drop. AVIOReader should reconnect and playback should resume.
+    let dropAfter = takeDoubleFlag("--drop-after", from: &rest)
     // --sliding is accepted-and-ignored for backward compat: sliding is now
     // the unconditional behaviour for a live session, so the flag is a no-op.
     _ = takeFlag("--sliding", from: &rest)
     exit(runLive(seconds: seconds, seed: seed, dvrWindow: dvrWindow,
                  serveOnly: serveOnly, measureRSS: measureRSS,
                  reportCacheBytes: reportCacheBytes, rewindTest: rewindTest,
-                 forceSoftware: forceSW))
+                 forceSoftware: forceSW, dropAfter: dropAfter))
 }
 
 // Subcommand path: explicit subcommand + flags + url.

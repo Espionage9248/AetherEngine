@@ -93,6 +93,15 @@ final class LiveFixture: @unchecked Sendable {
     private let stateLock = NSLock()
     private(set) var port: UInt16 = 0
 
+    /// When non-nil, the fixture will close the FIRST accepted client socket
+    /// after this many seconds of serving (simulating a single recoverable
+    /// mid-stream drop). Subsequent connections (the reconnect and any later
+    /// clients) are served normally without further forced drops.
+    var dropAfterSeconds: Double? = nil
+    /// Latched to true after the first drop has fired, so only one drop
+    /// is injected regardless of how many reconnects follow.
+    private var didFireDrop = false
+
     private let acceptQueue = DispatchQueue(
         label: "com.aetherengine.livefixture.accept",
         qos: .userInitiated
@@ -263,12 +272,24 @@ final class LiveFixture: @unchecked Sendable {
     /// Read (and discard) the HTTP request line, send a chunked-free
     /// streaming 200 response with no Content-Length, then push rewritten
     /// TS packets forever until the peer disconnects or `stop()` runs.
+    ///
+    /// If `dropAfterSeconds` is set and no drop has fired yet, closes this
+    /// connection after the configured number of seconds ONCE mid-stream
+    /// (simulating a single recoverable drop). The next accepted connection
+    /// (the reconnect) is served normally.
     private func serve(_ fd: Int32) {
+        // Track whether we own the close of this fd. The drop timer may
+        // close it first (to force RST); in that case the defer below
+        // must not double-close.
+        var fdClosedByDropTimer = false
+
         defer {
             stateLock.lock()
             clientFds.remove(fd)
             stateLock.unlock()
-            close(fd)
+            if !fdClosedByDropTimer {
+                close(fd)
+            }
         }
 
         // Drain the request headers (we only ever serve /live.ts, so the
@@ -282,6 +303,39 @@ final class LiveFixture: @unchecked Sendable {
             "Connection: close\r\n" +
             "\r\n"
         guard writeAll(fd: fd, bytes: Array(header.utf8)) else { return }
+
+        // If this is the first streaming connection and a drop is configured,
+        // schedule an async RST of this fd after `dropAfterSeconds`. Using
+        // SO_LINGER=0 + close() sends RST immediately, causing the client
+        // URLSession to receive a network error rather than a clean EOF, which
+        // exercises the persistent reader's error-driven reconnect path. The
+        // blocked send() in the write loop returns EBADF/EPIPE, serve() exits.
+        stateLock.lock()
+        let shouldScheduleDrop = (dropAfterSeconds != nil && !didFireDrop)
+        let dropDelay = dropAfterSeconds ?? 0
+        stateLock.unlock()
+
+        if shouldScheduleDrop {
+            let item = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.stateLock.lock()
+                let alreadyFired = self.didFireDrop
+                if !alreadyFired { self.didFireDrop = true }
+                self.stateLock.unlock()
+                if !alreadyFired {
+                    print("[LiveFixture] Injecting mid-stream drop after ~\(Int(dropDelay))s (fd=\(fd))")
+                    // SO_LINGER l_linger=0 causes close() to send RST.
+                    var ling = Darwin.linger()
+                    ling.l_onoff = 1
+                    ling.l_linger = 0
+                    _ = setsockopt(fd, SOL_SOCKET, SO_LINGER,
+                                   &ling, socklen_t(MemoryLayout<Darwin.linger>.size))
+                    Darwin.close(fd)
+                    fdClosedByDropTimer = true
+                }
+            }
+            workQueue.asyncAfter(deadline: .now() + dropDelay, execute: item)
+        }
 
         // Per-PID continuity counter, carried across loop boundaries so the
         // seam never produces a continuity_counter discontinuity.
@@ -304,7 +358,7 @@ final class LiveFixture: @unchecked Sendable {
                 packet.copyBytes(to: &scratch, count: LiveFixture.tsPacketSize)
                 rewritePacket(&scratch, tsOffset: tsOffset, ccByPID: &ccByPID)
                 if !writeAll(fd: fd, bytes: scratch) {
-                    return // peer gone, stop serving
+                    return // peer gone or fd closed by drop timer
                 }
             }
 

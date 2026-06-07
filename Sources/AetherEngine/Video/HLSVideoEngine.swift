@@ -539,7 +539,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         } else {
             dem = Demuxer()
             do {
-                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders)
+                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, isLive: isLiveSession)
             } catch {
                 throw HLSVideoEngineError.openFailed(reason: "\(error)")
             }
