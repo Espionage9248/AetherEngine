@@ -1132,6 +1132,7 @@ public final class AetherEngine: ObservableObject {
                     matchContentEnabled: options.matchContentEnabled,
                     panelIsInHDRMode: panelHDRAfterHandshake,
                     audioBridgeMode: options.audioBridgeMode,
+                    isLive: options.isLive,
                     preopenedDemuxer: probeOpened ? probe : nil
                 )
                 playbackBackend = .native
@@ -1188,6 +1189,7 @@ public final class AetherEngine: ObservableObject {
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
+        isLive: Bool = false,
         preopenedDemuxer: Demuxer? = nil
     ) async throws {
         let session = HLSVideoEngine(
@@ -1201,6 +1203,7 @@ public final class AetherEngine: ObservableObject {
             audioSourceStreamIndexOverride: audioSourceStreamIndex,
             initialPositionSeconds: startPosition,
             audioBridgeMode: audioBridgeMode,
+            isLiveSession: isLive,
             preopenedDemuxer: preopenedDemuxer
         )
         session.onFirstHDR10PlusDetected = { [weak self] in
