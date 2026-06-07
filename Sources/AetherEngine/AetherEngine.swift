@@ -702,8 +702,39 @@ public final class AetherEngine: ObservableObject {
     ///     "default-language audio plus black frame" at session start).
     ///     Validated against the container; an invalid index falls back
     ///     to the auto pick.
+    /// Load media from a URL. Convenience wrapper over `load(source:)`.
     public func load(
         url: URL,
+        startPosition: Double? = nil,
+        options: LoadOptions = .init(),
+        audioSourceStreamIndex: Int32? = nil
+    ) async throws {
+        try await load(
+            source: .url(url),
+            startPosition: startPosition,
+            options: options,
+            audioSourceStreamIndex: audioSourceStreamIndex
+        )
+    }
+
+    /// Load media from a URL or a custom `IOReader`. See `MediaSource`.
+    ///
+    /// Custom sources: seekable readers play on both the native and
+    /// software paths; forward-only readers (`seek` returns negative for
+    /// SEEK_SET/CUR/END) play on the software path only. A custom source
+    /// whose initial probe fails throws, since it cannot be reopened by URL.
+    ///
+    /// v1 limitations for custom sources. A custom source has no URL, so any
+    /// feature that reopens the source by URL is unavailable: mid-playback
+    /// audio-track switching (`selectAudioTrack`), background-return reload
+    /// (`reloadAtCurrentPosition`), embedded-subtitle selection (which opens
+    /// a second, concurrent side demuxer; a single-cursor reader cannot serve
+    /// both at once), and FrameExtractor scrub previews. These fall back to an
+    /// error or no-op rather than crashing. Plain start-to-finish playback,
+    /// seeking within a seekable reader, and external/sidecar subtitles are
+    /// unaffected.
+    public func load(
+        source: MediaSource,
         startPosition: Double? = nil,
         options: LoadOptions = .init(),
         audioSourceStreamIndex: Int32? = nil
@@ -715,6 +746,17 @@ public final class AetherEngine: ObservableObject {
         // in the dispatch below releases the preserved host.
         let priorBackendWasNative = (playbackBackend == .native)
         stopInternal(keepNativeHost: priorBackendWasNative)
+        // A url binding the rest of the body uses. For custom sources this
+        // is synthetic: it is never dereferenced for I/O (probe, native, and
+        // software opens all run against the preopened probe demuxer below),
+        // only used for non-I/O bookkeeping such as loadedURL.
+        let url: URL
+        switch source {
+        case .url(let u):
+            url = u
+        case .custom:
+            url = URL(string: "aether-custom://source")!
+        }
         loadedURL = url
         loadedOptions = options
         isLive = options.isLive
@@ -752,8 +794,13 @@ public final class AetherEngine: ObservableObject {
             // suspension point. `Task.detached.value` introduces a real
             // hop to a background thread so the @MainActor runloop keeps
             // ticking.
-            try await Task.detached(priority: .userInitiated) { [probe] in
-                try probe.open(url: url, extraHeaders: options.httpHeaders)
+            try await Task.detached(priority: .userInitiated) { [probe, source, options] in
+                switch source {
+                case .url(let u):
+                    try probe.open(url: u, extraHeaders: options.httpHeaders)
+                case .custom(let reader, let formatHint):
+                    try probe.open(reader: reader, formatHint: formatHint)
+                }
             }.value
             probeOpened = true
             let videoIdx = probe.videoStreamIndex
@@ -788,6 +835,12 @@ public final class AetherEngine: ObservableObject {
             // close is a no-op.
         } catch {
             EngineLog.emit("[AetherEngine] probe failed (\(error)); proceeding without criteria", category: .engine)
+        }
+
+        // Custom sources have no URL to reopen from: a failed probe is fatal.
+        if case .custom = source, !probeOpened {
+            state = .error("Failed to load: custom source probe failed")
+            throw DemuxerError.openFailed(code: -1)
         }
 
         // Source format is what the probe found in the file, before any
