@@ -550,6 +550,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// the first boundary (defensive: shouldn't happen post-gate);
     /// returns the last segment index for any pts past the last
     /// boundary.
+
     /// Live-mode segment index for a VIDEO packet. Forward-only keyframe
     /// cutter: the first keyframe opens segment `baseIndex`; a later
     /// keyframe whose source-pts is at least `targetSegmentDurationSeconds`
@@ -1371,14 +1372,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     // keyframe cutter advances on a keyframe past the
                     // duration target (using the shifted pts so the
                     // segment boundaries align with the muxer timeline).
-                    // VOD: unchanged below at the look-behind site.
-                    let thisVideoSeg: Int
-                    if isLive {
-                        let isKey = (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
-                        thisVideoSeg = liveVideoSegmentIndex(pts: packet.pointee.pts, isKeyframe: isKey)
-                    } else {
-                        thisVideoSeg = 0 // unused for VOD; routing uses prev.dts below
-                    }
+                    // VOD: unused below; routing uses prev.dts at the look-behind site.
+                    let thisVideoSeg = isLive
+                        ? liveVideoSegmentIndex(
+                            pts: packet.pointee.pts,
+                            isKeyframe: (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
+                          )
+                        : 0
                     if let prev = pendingVideoPkt {
                         // Determine which segment `prev` belongs to.
                         // VOD: DTS lookup against the precomputed plan

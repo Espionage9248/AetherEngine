@@ -2544,8 +2544,12 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
             )
             return
         }
-        let startPts = Int64(startSeconds * 1000)
-        let endPts = Int64((startSeconds + durationSeconds) * 1000)
+        // unused for live; left 0 to avoid a wrong-timebase latent value
+        // (source video TB is not reachable from this provider without a
+        // large new dependency; DVR restart machinery will supply correct
+        // values when wired)
+        let startPts: Int64 = 0
+        let endPts: Int64 = 0
         segments.append(HLSVideoEngine.Segment(
             startPts: startPts,
             endPts: endPts,
@@ -2561,6 +2565,7 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     /// new segment fetch so the playlist already lists the target by
     /// the time AVPlayer re-reads it. Idempotent and monotonic.
     func extendVisibleWindow(toCover index: Int) {
+        guard !isLive else { return }   // live uses segments.count directly; window/endlist are VOD-only
         stateLock.lock()
         defer { stateLock.unlock() }
         guard !endlistAdded else { return }
