@@ -53,6 +53,7 @@ You provide the transport bar. You provide the dropdowns. You provide the pretty
 | Streaming   | Playback reads the source over one long-lived forward-streaming `URLSession` connection (VLC-style): bytes stream into a sliding window, a new request is issued only on a seek outside that window. Still extraction uses discrete Range chunks for random access; live transcode uses a single sequential GET |
 | Live        | Scaffold-level: `LoadOptions.isLive` opts the session in; engine publishes `@Published var isLive` for hosts, ignores `seek()`. H.264 / HEVC inside MPEG-TS routes through the native AVPlayer pipeline; MPEG-2 / MPEG-4 / VC-1 / VP8 / VP9 inside MPEG-TS routes through the SW pipeline. Sliding-window segment eviction for unbounded sessions is not yet implemented (long native-path sessions will accumulate cached segments) |
 | Resilience  | Direct-URL playback survives CDN stutters: a dropped connection, socket stall, or early close reconnects at the last byte delivered instead of ending playback (only the real end of file reports EOF). `429` / `503` honour `Retry-After`, expired signed URLs re-resolve against the source, and a progress-aware cap stops a dead or flapping origin from hammering the CDN. Plus background pause and a display-link aware lifecycle |
+| Custom input | Play from any byte source via the `IOReader` protocol, passed as `MediaSource.custom` to `load(source:)`: memory buffers, encrypted-at-rest archives, proprietary containers. Seekable readers work on both the native and software playback paths; forward-only readers (seek returns negative) work on the software path only |
 
 ## Quick start
 
@@ -127,6 +128,22 @@ await frames?.shutdown()                           // prompt teardown (else idle
 ```
 
 Subtitle cues land in raw source PTS. On the native path, AVPlayer's HLS clock sits at `source_pts - producer.videoShiftPts` (the producer applies a per-session shift to align the first segment's tfdt with the playlist origin, and the shift can change on every restart). Render the overlay against `player.sourceTime` so cues match the spoken audio regardless of which producer session is active.
+
+### Custom input source
+
+```swift
+final class MyArchiveReader: IOReader {
+    func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 { /* ... */ }
+    func seek(offset: Int64, whence: Int32) -> Int64 { /* ... */ }
+    func close() { /* ... */ }
+}
+
+try await engine.load(source: .custom(MyArchiveReader(), formatHint: "mp4"))
+```
+
+> **Security.** On the native path, bytes supplied by a custom `IOReader` are re-muxed to cleartext fMP4 and served via the loopback HLS cache (disk + `127.0.0.1`) to AVPlayer. This is fine for encrypted-at-rest archives (the source is decrypted in memory, never written to disk in original form), but is a cleartext exposure if the source is encrypted for content protection.
+>
+> **Limitations.** Features that reopen the source by URL are unavailable for custom sources: mid-playback audio-track switching, background-return reload, embedded-subtitle selection, and `FrameExtractor` scrub previews. Plain playback, seeking within a seekable reader, and sidecar subtitles are unaffected.
 
 Install via Swift Package Manager:
 
