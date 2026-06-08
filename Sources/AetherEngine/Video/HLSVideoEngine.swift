@@ -2773,7 +2773,6 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     func appendLiveSegment(index: Int, startSeconds: Double, durationSeconds: Double,
                            discontinuous: Bool = false) {
         stateLock.lock()
-        let wasEmpty = segments.isEmpty
         guard index == segments.count else {
             stateLock.unlock()
             EngineLog.emit(
@@ -2797,14 +2796,12 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
             discontinuous: discontinuous
         ))
         stateLock.unlock()
-        // Signal `waitForFirstLiveSegment` if this is the first segment
-        // so the server's manifest handler can unblock and serve a playlist
-        // that already contains playable content.
-        if wasEmpty {
-            firstSegmentCondition.lock()
-            firstSegmentCondition.broadcast()
-            firstSegmentCondition.unlock()
-        }
+        // Wake the manifest handler's startup-buffer wait on every append (not
+        // just the first), so it can unblock once the configured startup
+        // segment count exists. One broadcast per ~4 s segment is negligible.
+        firstSegmentCondition.lock()
+        firstSegmentCondition.broadcast()
+        firstSegmentCondition.unlock()
     }
 
     // MARK: - Sliding-window operations
@@ -3200,12 +3197,30 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     var liveTargetSegmentDuration: Double? {
         isLive ? liveWindowSizing.targetSegmentDurationSeconds : nil
     }
-    /// Block the calling thread until the first live segment is appended,
-    /// or until `timeout` seconds elapse. Returns true if a segment is
-    /// available, false on timeout. Non-live sessions return immediately.
-    /// Used by the manifest handler to avoid serving an empty live playlist
-    /// that causes AVPlayer to fire CoreMediaErrorDomain -12888 on the
-    /// very first poll (before any `#EXTINF` entries exist).
+    /// Live startup buffer, in segments. The manifest handler holds the FIRST
+    /// playlist response until this many segments exist, so AVPlayer (which
+    /// starts a live `.live` playlist at its oldest listed segment, reinforced
+    /// by the host's explicit seek-to-0) begins `liveStartupSegments - 1`
+    /// segments BEHIND the production edge and keeps that gap (production and
+    /// playback both run at 1x, so the cushion is constant). This absorbs the
+    /// real-time-transcode jitter that otherwise starves the bleeding edge
+    /// (-16832 "restarting from end of live playlist" + playbackStalled). 2 =
+    /// one segment (~4 s) of cushion: the minimum that gives any headroom, at
+    /// the cost of ~one extra segment of startup latency. Distinct from the
+    /// reverted live-edge hold-back, which trailed the ADVERTISED edge while
+    /// still starting AVPlayer at the bleeding edge (1 segment) and so never
+    /// built a cushion. 1 disables (serve at the first segment, old behaviour).
+    private static let liveStartupSegments = 2
+
+    /// Block the calling thread until at least `liveStartupSegments` live
+    /// segments have been appended, or until `timeout` seconds elapse. Returns
+    /// true if enough segments are available, false on timeout. Non-live
+    /// sessions return immediately. Holding the first manifest response this
+    /// way (a) avoids serving an empty live playlist that fires
+    /// CoreMediaErrorDomain -12888 on the very first poll, and (b) gives
+    /// AVPlayer a startup cushion behind the live edge (see
+    /// `liveStartupSegments`). Subsequent polls return instantly once the
+    /// count is reached, so only the first response is delayed.
     func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool {
         guard isLive else { return true }
         let deadline = Date().addingTimeInterval(timeout)
@@ -3215,8 +3230,8 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
             stateLock.lock()
             let count = segments.count
             stateLock.unlock()
-            if count > 0 { return true }
-            if !firstSegmentCondition.wait(until: deadline) { return false }
+            if count >= Self.liveStartupSegments { return true }
+            if !firstSegmentCondition.wait(until: deadline) { return count > 0 }
         }
     }
     var masterCodecs: String? { codecsString }
