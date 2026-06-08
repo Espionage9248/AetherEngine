@@ -1324,6 +1324,20 @@ public final class AetherEngine: ObservableObject {
                   startPosition: nil,
                   perFrameHDR: true,
                   skipInitialSeek: true)
+
+        // Self-start playback. The VOD native path triggers play() at the
+        // tail of load() (after loadNative returns + the display-criteria
+        // handshake); this lean path early-returns from load() before that
+        // code, so it must start the AVPlayer itself. No criteria handshake
+        // here: AVKit drives match-content from the live AVPlayerItem on the
+        // AVPlayerViewController. AVPlayer's `automaticallyWaitsToMinimize-
+        // Stalling = true` handles "play before ready" — it sits in
+        // `waitingToPlayAtSpecifiedRate`, buffers the first segments, then
+        // plays. Without this the item loads to `readyToPlay` but stays at
+        // `timeControlStatus == .paused` (one frame, never advances).
+        host.play()
+        state = .playing
+        startMemoryProbe()
     }
 
     private func loadNative(
