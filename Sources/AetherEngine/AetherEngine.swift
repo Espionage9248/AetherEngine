@@ -991,6 +991,17 @@ public final class AetherEngine: ObservableObject {
             throw DemuxerError.openFailed(code: -1)
         }
 
+        // Live fail-fast: a live source whose probe could not even open is a
+        // dead tuner (the AVIOReader already burned its full reconnect
+        // budget getting here). Proceeding would dispatch on codec NONE and
+        // grind a second, equally doomed open for another ~30 s of spinner
+        // before erroring out. Fail now so the host can show the error (or
+        // try the next channel) immediately.
+        if options.isLive, !probeOpened {
+            state = .error("Live source unavailable")
+            throw DemuxerError.openFailed(code: -5)
+        }
+
         // Record seekability for reload gating (forward-only custom sources
         // cannot rewind, so audio-switch / background-reload stay no-op).
         customSourceIsSeekable = isCustomSource ? probe.isSourceSeekable : false
