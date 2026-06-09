@@ -447,6 +447,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// the silent failure mode in the log so the user-visible "lädt
     /// unendlich" symptom maps to a concrete cause.
     private var pregateVideoDropCount: Int = 0
+    /// Wall-clock start of the video keyframe-gate wait (first dropped
+    /// pre-gate packet). Live sessions bound the wait with
+    /// `liveKeyframeGateTimeoutSeconds`; see the gate for rationale.
+    private var pregateWaitStart: Date?
+    private static let liveKeyframeGateTimeoutSeconds: TimeInterval = 15
     private var pregateAudioDropCount: Int = 0
     private var lastPregateVideoLog: Int = 0
     private var lastPregateAudioLog: Int = 0
@@ -572,6 +577,51 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// currentTime.
     var onLiveTimelineRebase: (@Sendable (_ shiftPts: Int64, _ seamOutputSeconds: Double) -> Void)?
 
+    /// Why the pump loop exited. Set exactly once, right before
+    /// `didFinishFlag`; readable after `waitForFinish` returns true and
+    /// delivered via `onPumpFinished`.
+    enum PumpExitReason: Sendable, CustomStringConvertible {
+        /// Clean end of stream (VOD tail, or a live source that closed
+        /// gracefully; for live the engine treats this like a source
+        /// loss, a healthy live source never EOFs).
+        case eof
+        /// `stop()` was called (teardown / scrub restart).
+        case stopRequested
+        /// `demuxer.readPacket()` threw after the AVIO reader exhausted
+        /// its reconnect budget (live) or hit a hard I/O error.
+        case readError(code: Int32)
+        /// A muxer allocation / rotation failed mid-pump.
+        case muxerFailed
+        /// Live keyframe gate: no `AV_PKT_FLAG_KEY` video packet arrived
+        /// within the timeout (mis-flagged source); the stream would
+        /// starve forever, so the pump exits and lets the engine's
+        /// reopen path retry with a fresh source connection.
+        case keyframeStarvation
+
+        var description: String {
+            switch self {
+            case .eof: return "eof"
+            case .stopRequested: return "stopRequested"
+            case .readError(let code): return "readError(\(code))"
+            case .muxerFailed: return "muxerFailed"
+            case .keyframeStarvation: return "keyframeStarvation"
+            }
+        }
+    }
+
+    /// Fires exactly once when the pump loop has fully unwound (after
+    /// the final segment was finalized and `didFinishFlag` broadcast).
+    /// The engine uses this on live sessions to drive the bounded
+    /// reopen-with-backoff recovery when the source was lost.
+    var onPumpFinished: (@Sendable (PumpExitReason) -> Void)?
+
+    /// Marks the FIRST segment this producer opens as discontinuous
+    /// (`#EXT-X-DISCONTINUITY`). Set by the engine's live-reopen path:
+    /// the fresh source connection joins the broadcast at "now", so the
+    /// content (and source clock) jump relative to the last segment the
+    /// failed producer delivered.
+    var firstSegmentDiscontinuous = false
+
     /// Latched once the signature has been seen in this producer's
     /// packet stream so the scan goes silent for the remainder of the
     /// session. The byte scan is cheap (~µs per packet) but there's no
@@ -675,7 +725,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             liveCurrentSegmentIndex = baseIndex
             liveSegmentStartPtsSeconds = ptsSeconds
             liveSegmentStartByIndex[liveCurrentSegmentIndex] = ptsSeconds
-            liveSegmentDiscontinuousByIndex[liveCurrentSegmentIndex] = false
+            liveSegmentDiscontinuousByIndex[liveCurrentSegmentIndex] = firstSegmentDiscontinuous
             // A boundary before the first segment has nothing to separate.
             pendingForceCutFlag = false
             return liveCurrentSegmentIndex
@@ -1002,14 +1052,18 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
         let pumpStart = DispatchTime.now()
         var packetsRead = 0
-        let lastError: Int32 = 0
+        var lastError: Int32 = 0
+        var exitReason: PumpExitReason = .eof
 
         do {
             readLoop: while true {
                 stateLock.lock()
                 let stopRequested = shouldStop
                 stateLock.unlock()
-                if stopRequested { break readLoop }
+                if stopRequested {
+                    exitReason = .stopRequested
+                    break readLoop
+                }
 
                 guard let packet = try demuxer.readPacket() else {
                     // EOF
@@ -1424,6 +1478,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             || (packet.pointee.dts != Int64.min && packet.pointee.dts >= restartTargetVideoDts)
                         guard isKey, targetSatisfied else {
                             pregateVideoDropCount += 1
+                            if pregateVideoDropCount == 1 {
+                                pregateWaitStart = Date()
+                            }
                             if pregateVideoDropCount - lastPregateVideoLog >= Self.pregateLogInterval {
                                 lastPregateVideoLog = pregateVideoDropCount
                                 EngineLog.emit(
@@ -1434,6 +1491,25 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                     + "baseIndex=\(baseIndex)",
                                     category: .session
                                 )
+                            }
+                            // Live-only bounded wait: a source that never
+                            // flags a keyframe (mis-flagged TS) would starve
+                            // the cutter forever with nothing but the
+                            // periodic log above. Exit with a terminal
+                            // reason instead and let the engine's reopen
+                            // path retry with a fresh source connection.
+                            // VOD keeps the unbounded wait (the scan-forward
+                            // restart machinery depends on it).
+                            if isLive, let started = pregateWaitStart,
+                               Date().timeIntervalSince(started) > Self.liveKeyframeGateTimeoutSeconds {
+                                EngineLog.emit(
+                                    "[HLSSegmentProducer] live keyframe gate timed out after "
+                                    + "\(Int(Self.liveKeyframeGateTimeoutSeconds))s "
+                                    + "(dropped=\(pregateVideoDropCount)); exiting pump for reopen",
+                                    category: .session
+                                )
+                                exitReason = .keyframeStarvation
+                                break readLoop
                             }
                             continue
                         }
@@ -1741,6 +1817,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             var pkt: UnsafeMutablePointer<AVPacket>? = prev
                             trackedPacketFree(&pkt)
                             pendingVideoPkt = nil
+                            exitReason = .muxerFailed
                             break readLoop
                         }
                     }
@@ -1823,6 +1900,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             var pkt: UnsafeMutablePointer<AVPacket>? = prev
                             trackedPacketFree(&pkt)
                             pendingAudioPkt = nil
+                            exitReason = .muxerFailed
                             break readLoop
                         }
                     }
@@ -1833,10 +1911,26 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 }
             }
         } catch {
+            if case DemuxerError.readFailed(let code) = error {
+                lastError = code
+                exitReason = .readError(code: code)
+            } else {
+                lastError = -1
+                exitReason = .readError(code: -1)
+            }
             EngineLog.emit(
                 "[HLSSegmentProducer] demuxer.readPacket threw: \(error)",
                 category: .session
             )
+        }
+
+        // A muxer-failure break during a stop()-initiated backpressure
+        // wait is teardown, not an error; report it as such.
+        if case .muxerFailed = exitReason {
+            stateLock.lock()
+            let stopped = shouldStop
+            stateLock.unlock()
+            if stopped { exitReason = .stopRequested }
         }
 
         // Flush look-behind pending packets. No successor packet
@@ -1887,7 +1981,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
         finalizeSessionMuxerAndAdopt()
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - pumpStart.uptimeNanoseconds) / 1_000_000
         EngineLog.emit(
-            "[HLSSegmentProducer] pump finished: packetsRead=\(packetsRead) "
+            "[HLSSegmentProducer] pump finished: reason=\(exitReason) "
+            + "packetsRead=\(packetsRead) "
             + "packetsWritten=\(packetsWrittenCount) lastError=\(lastError) "
             + "elapsed=\(String(format: "%.0f", elapsedMs))ms cacheCount=\(cache.count)",
             category: .session
@@ -1897,6 +1992,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
         didFinishFlag = true
         finishCondition.broadcast()
         finishCondition.unlock()
+
+        onPumpFinished?(exitReason)
     }
 
     // MARK: - Look-behind finalize helpers

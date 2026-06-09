@@ -1416,7 +1416,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// the given absolute segment index. Used both for the initial
     /// session bring-up (baseIndex=0) and for the backward / forward
     /// scrub restart path.
-    private func makeProducer(baseIndex: Int) throws -> HLSSegmentProducer {
+    private func makeProducer(
+        baseIndex: Int,
+        liveReopenOutputEndSeconds: Double? = nil
+    ) throws -> HLSSegmentProducer {
         guard let dem = demuxer, let cache = cache, let cfg = savedVideoConfig else {
             throw HLSVideoEngineError.notStarted
         }
@@ -1444,7 +1447,23 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let videoTarget: Int64
         let desiredVideoTfdt: Int64
         let desiredAudioTfdt: Int64
-        if baseIndex > 0, baseIndex < segmentPlan.count {
+        if let endSeconds = liveReopenOutputEndSeconds {
+            // Live reopen after source loss: no scan target (join the
+            // fresh source at its head), but the first fragment's tfdt
+            // must CONTINUE the output timeline where the failed
+            // producer's last appended segment ended, so AVPlayer's
+            // cumulative-EXTINF clock and the fragment timestamps stay
+            // on one axis across the reopen seam (the seam segment
+            // additionally carries #EXT-X-DISCONTINUITY via
+            // firstSegmentDiscontinuous).
+            videoTarget = Int64.min
+            desiredVideoTfdt = sourceVideoTbSeconds > 0
+                ? Int64(endSeconds / sourceVideoTbSeconds)
+                : 0
+            desiredAudioTfdt = savedAudioConfig.map {
+                av_rescale_q(desiredVideoTfdt, cfg.timeBase, $0.sourceTimeBase)
+            } ?? 0
+        } else if baseIndex > 0, baseIndex < segmentPlan.count {
             videoTarget = segmentPlan[baseIndex].startPts
             desiredVideoTfdt = segmentPlan[baseIndex].startPts - firstKeyframePts
             // Rescale into the source audio TB (not the bridge encoder
@@ -1474,7 +1493,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // entry is the endPts of the final segment so the producer
         // has a known upper bound for its segmentIndex() lookup. The
         // producer indexes this slice with `i = absoluteSegIdx - baseIndex`.
-        let plannedSegs = segmentPlan[baseIndex..<segmentPlan.count]
+        // Clamp the lower bound: a live reopen passes baseIndex >
+        // segmentPlan.count (the plan is empty for live), which would
+        // otherwise build an invalid range.
+        let plannedSegs = segmentPlan[min(baseIndex, segmentPlan.count)..<segmentPlan.count]
         var segmentBoundaries: [Int64] = plannedSegs.map { $0.startPts }
         if let last = plannedSegs.last {
             segmentBoundaries.append(last.endPts)
@@ -1505,7 +1527,159 @@ public final class HLSVideoEngine: @unchecked Sendable {
         prod.onLiveTimelineRebase = { [weak self] shiftPts, seamOutputSeconds in
             self?.handleLiveTimelineRebase(shiftPts, seamOutputSeconds: seamOutputSeconds)
         }
+        prod.onPumpFinished = { [weak self, weak prod] reason in
+            guard let self, let prod else { return }
+            self.handlePumpFinished(prod, reason: reason)
+        }
         return prod
+    }
+
+    // MARK: - Live source-loss recovery
+
+    /// Bounded reopen-with-backoff after a live source is lost. The AVIO
+    /// reader already absorbs transient drops by reconnecting internally
+    /// (up to its unproductive-reconnect cap), so the pump only exits on
+    /// a genuinely exhausted source: the Jellyfin transcode died, the
+    /// tuner dropped, or the network was gone long enough to blow the
+    /// reader's budget. For VOD the engine's restartHandler covers
+    /// recovery; live had NO recovery at all (the stream stayed dead
+    /// until the user re-entered the channel). The reopen tears down the
+    /// dead demuxer, dials a fresh source connection, and brings up a
+    /// producer that continues the output timeline (see
+    /// `liveReopenOutputEndSeconds` in `makeProducer`).
+    private static let liveReopenMaxAttempts = 6
+
+    private func handlePumpFinished(_ prod: HLSSegmentProducer,
+                                    reason: HLSSegmentProducer.PumpExitReason) {
+        guard isLiveSession else { return }
+        switch reason {
+        case .stopRequested, .muxerFailed:
+            return
+        case .eof, .readError, .keyframeStarvation:
+            // A healthy live source never EOFs; treat it like a loss.
+            break
+        }
+        EngineLog.emit(
+            "[HLSVideoEngine] live pump exited (reason=\(reason)); starting reopen",
+            category: .session
+        )
+        Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.performLiveReopen(failedProducer: prod)
+        }
+    }
+
+    private func performLiveReopen(failedProducer: HLSSegmentProducer) async {
+        for attempt in 1...Self.liveReopenMaxAttempts {
+            // Abort silently when the session was torn down (stop() nils
+            // the producer) or someone else already replaced it.
+            guard currentProducerIs(failedProducer) else { return }
+
+            // Capped exponential backoff: 0.5, 1, 2, 4, 8, 8 s (~23 s
+            // total). Enough to ride out a Jellyfin transcode respawn
+            // without hammering a dead tuner.
+            let delay = min(0.5 * pow(2.0, Double(attempt - 1)), 8.0)
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+
+            let dem = Demuxer()
+            do {
+                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, isLive: true)
+            } catch {
+                EngineLog.emit(
+                    "[HLSVideoEngine] live reopen attempt \(attempt)/\(Self.liveReopenMaxAttempts) failed: \(error)",
+                    category: .session
+                )
+                dem.close()
+                continue
+            }
+            // Same channel URL must yield the same stream layout; the
+            // reopened producer reuses savedVideoConfig/savedAudioConfig,
+            // which embed stream indices and time bases from the
+            // original probe. A mismatch means the server handed us a
+            // different transcode shape: retry rather than corrupt.
+            guard dem.videoStreamIndex == videoStreamIndex else {
+                EngineLog.emit(
+                    "[HLSVideoEngine] live reopen attempt \(attempt): video stream index "
+                    + "changed (\(dem.videoStreamIndex) != \(videoStreamIndex)), retrying",
+                    category: .session
+                )
+                dem.close()
+                continue
+            }
+
+            switch finishLiveReopen(failedProducer: failedProducer, dem: dem, attempt: attempt) {
+            case .done, .aborted:
+                return
+            case .retry:
+                continue
+            }
+        }
+        EngineLog.emit(
+            "[HLSVideoEngine] live reopen FAILED after \(Self.liveReopenMaxAttempts) attempts; "
+            + "source considered permanently lost",
+            category: .session
+        )
+    }
+
+    /// Synchronous helper for the locked sections of the reopen (NSLock
+    /// is unavailable from async contexts).
+    private func currentProducerIs(_ p: HLSSegmentProducer) -> Bool {
+        restartLock.lock()
+        defer { restartLock.unlock() }
+        return producer === p
+    }
+
+    private enum LiveReopenOutcome { case done, aborted, retry }
+
+    /// Swap the freshly opened demuxer in and bring up the continuation
+    /// producer. Synchronous (locked); called from the async retry loop.
+    private func finishLiveReopen(failedProducer: HLSSegmentProducer,
+                                  dem: Demuxer,
+                                  attempt: Int) -> LiveReopenOutcome {
+        restartLock.lock()
+        guard producer === failedProducer, let prov = provider else {
+            restartLock.unlock()
+            dem.close()
+            return .aborted
+        }
+        let oldDem = demuxer
+        demuxer = dem
+        let (nextIndex, outputEnd) = prov.liveContinuationPoint()
+        do {
+            let newProd = try makeProducer(
+                baseIndex: nextIndex,
+                liveReopenOutputEndSeconds: outputEnd
+            )
+            // The fresh connection joins the broadcast at "now":
+            // content and source clock jump relative to the last
+            // delivered segment, so the seam segment carries
+            // #EXT-X-DISCONTINUITY and the shift handoff is deferred
+            // to the seam (same mechanism as a program-boundary
+            // rebase; an immediate onVideoShiftKnown would jump the
+            // host clock while pre-loss content is still on screen).
+            newProd.firstSegmentDiscontinuous = true
+            newProd.onVideoShiftKnown = { [weak self] shiftPts in
+                self?.handleLiveTimelineRebase(shiftPts, seamOutputSeconds: outputEnd)
+            }
+            producer = newProd
+            restartLock.unlock()
+            oldDem?.close()
+            newProd.start()
+            EngineLog.emit(
+                "[HLSVideoEngine] live reopen succeeded on attempt \(attempt): "
+                + "continuing at seg\(nextIndex) (outputEnd=\(String(format: "%.1f", outputEnd))s)",
+                category: .session
+            )
+            return .done
+        } catch {
+            demuxer = oldDem
+            restartLock.unlock()
+            dem.close()
+            EngineLog.emit(
+                "[HLSVideoEngine] live reopen attempt \(attempt): producer build failed (\(error))",
+                category: .session
+            )
+            return .retry
+        }
     }
 
     /// Converts the producer's `videoShiftPts` (in source video TB)
@@ -3312,7 +3486,22 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
             let count = segments.count
             stateLock.unlock()
             if count >= Self.liveStartupSegments { return true }
-            if !firstSegmentCondition.wait(until: deadline) { return count > 0 }
+            if !firstSegmentCondition.wait(until: deadline) {
+                // Degraded start: serving the first playlist with fewer
+                // than liveStartupSegments segments loses the startup
+                // cushion that absorbs transcode jitter, so a -16832
+                // "restarting from end of live playlist" stall right
+                // after startup becomes likely. Make it observable.
+                if count > 0 && count < Self.liveStartupSegments {
+                    EngineLog.emit(
+                        "[HLSVideoEngine] WARNING: live startup degraded, serving first "
+                        + "playlist with \(count)/\(Self.liveStartupSegments) segments after "
+                        + "\(Int(timeout))s timeout (no startup cushion)",
+                        category: .session
+                    )
+                }
+                return count > 0
+            }
         }
     }
 
@@ -3324,6 +3513,19 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
         waitersCancelled = true
         firstSegmentCondition.broadcast()
         firstSegmentCondition.unlock()
+    }
+
+    /// Where a live-reopen producer must continue: the next segment
+    /// index to append, and the OUTPUT-timeline end (seconds) of the
+    /// last appended segment, which becomes the new producer's desired
+    /// first tfdt so the output timeline stays continuous across the
+    /// reopen seam.
+    func liveContinuationPoint() -> (nextIndex: Int, outputEndSeconds: Double) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        let next = segments.count
+        let end = segments.last.map { $0.startSeconds + $0.durationSeconds } ?? 0
+        return (next, end)
     }
 
     /// LL-HLS blocking reload: block until segment `index` (0-based absolute
