@@ -499,9 +499,18 @@ final class HLSLocalServer: @unchecked Sendable {
         if fdToClose >= 0 {
             close(fdToClose)
         }
-        // Close all active client fds to unblock recv/send.
+        // shutdown() (NOT close) the active client fds to unblock
+        // recv/send. close() here would release the fd NUMBER while the
+        // connection handler still owns it; on the process-wide singleton
+        // engine the next session (channel zap) immediately opens new
+        // sockets/files that recycle those numbers, so the handler's
+        // late send() / deferred close() would then hit a foreign
+        // descriptor (the new session's segment file or AVPlayer
+        // connection). shutdown() wakes the blocked syscalls (recv
+        // returns 0, send fails EPIPE) but keeps the number reserved
+        // until the handler's single deferred close() releases it.
         for fd in clients {
-            close(fd)
+            shutdown(fd, SHUT_RDWR)
         }
     }
 

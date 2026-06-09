@@ -1353,6 +1353,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // way.
         let preopened = preopenedDemuxer
         preopenedDemuxer = nil
+        let prov = provider
         provider = nil
         savedVideoConfig = nil
         savedAudioConfig = nil
@@ -1363,6 +1364,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // unwinding immediately. waitForFinish + the rest of the
         // resource teardown move to a detached task.
         p?.stop()
+
+        // Wake any server thread parked in an LL-HLS blocking playlist
+        // reload. The producer is stopped, so no segment append will
+        // ever broadcast the condition again; without this the parked
+        // thread sleeps out its full 18-30 s timeout holding the
+        // provider alive and then writes into a possibly-recycled fd.
+        prov?.cancelWaiters()
 
         // Unblock the pump's read synchronously. A live producer can be parked
         // inside av_read_frame in the AVIO reconnect loop, which only exits on
@@ -2702,6 +2710,18 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     /// holding the segment-list lock. Signaled once from
     /// `appendLiveSegment` when `segments.count` transitions from 0 to 1.
     private let firstSegmentCondition = NSCondition()
+    /// Set by `cancelWaiters()` when the engine tears the session down.
+    /// With LL-HLS blocking reload, AVPlayer has a parked playlist request
+    /// open at essentially all times during steady-state live playback
+    /// (waiting on the next segment, which only arrives ~one target
+    /// duration later). Once the producer is stopped no append will ever
+    /// broadcast again, so without this flag the parked server thread
+    /// sleeps out its full timeout (18-30 s) after stop(), pinning the
+    /// provider + SegmentCache via its strong reference and then writing
+    /// a stale playlist into a connection of the NEXT session if the fd
+    /// number was recycled (engine is a process-wide singleton; channel
+    /// zap restarts immediately). Guarded by `firstSegmentCondition`.
+    private var waitersCancelled = false
     private var visibleHighWater: Int
     private var refreshCounter: Int = 0
     private var endlistAdded: Bool = false
@@ -3227,12 +3247,23 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
         firstSegmentCondition.lock()
         defer { firstSegmentCondition.unlock() }
         while true {
+            if waitersCancelled { return false }
             stateLock.lock()
             let count = segments.count
             stateLock.unlock()
             if count >= Self.liveStartupSegments { return true }
             if !firstSegmentCondition.wait(until: deadline) { return count > 0 }
         }
+    }
+
+    /// Wake every thread parked in `waitForFirstLiveSegment` /
+    /// `waitForLiveSegment` and make all future waits return immediately.
+    /// Called from `HLSVideoEngine.stop()`; see `waitersCancelled`.
+    func cancelWaiters() {
+        firstSegmentCondition.lock()
+        waitersCancelled = true
+        firstSegmentCondition.broadcast()
+        firstSegmentCondition.unlock()
     }
 
     /// LL-HLS blocking reload: block until segment `index` (0-based absolute
@@ -3248,6 +3279,7 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
         firstSegmentCondition.lock()
         defer { firstSegmentCondition.unlock() }
         while true {
+            if waitersCancelled { return false }
             stateLock.lock()
             let count = segments.count
             stateLock.unlock()
