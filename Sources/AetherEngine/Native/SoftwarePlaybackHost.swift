@@ -892,6 +892,7 @@ final class SoftwarePlaybackHost {
         var frameIntervalSec = 0.0
         var discontinuityOffsetSec = 0.0
         var loggedSWDiscontinuity = false
+        var lastSeenExtradata: Data? = nil
 
         defer {
             // Whatever the exit path, wake the feeder so it can drain +
@@ -918,6 +919,30 @@ final class SoftwarePlaybackHost {
             }
 
             let streamIdx = packet.pointee.stream_index
+
+            // In-band codec parameter change detection. libavcodec SW
+            // decoders pick up in-band SPS/PPS changes on their own; the
+            // VT HEVC path keeps its session-start format description and
+            // would wedge or corrupt on a real change. Log loudly so a
+            // real-world repro is identifiable; the
+            // VTDecompressionSession reinit is gated on one.
+            if streamIdx == videoStreamIndex {
+                var sdSize: Int = 0
+                if let sd = av_packet_get_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, &sdSize),
+                   sdSize > 0 {
+                    let newExtra = Data(bytes: sd, count: sdSize)
+                    if newExtra != lastSeenExtradata {
+                        lastSeenExtradata = newExtra
+                        EngineLog.emit(
+                            "[SWHost] WARNING: in-band video extradata change (\(sdSize) bytes) "
+                            + "on the live source. SW decoders follow in-band parameter sets; "
+                            + "the VT HEVC decoder keeps its session-start format description "
+                            + "and needs a reinit if artifacts follow.",
+                            category: .swPlayback
+                        )
+                    }
+                }
+            }
 
             // Live PTS-discontinuity detection + reconciliation, same
             // accrual as the combined loop (see its comment block).

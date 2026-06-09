@@ -291,6 +291,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var pendingAudioShiftOverride: Int64? = nil
     private static let rebasePairingWindowSeconds: TimeInterval = 5.0
 
+    /// Last in-band video extradata observed via
+    /// AV_PKT_DATA_NEW_EXTRADATA (live only). Used to deduplicate the
+    /// codec-parameter-change detection: some demuxers re-emit identical
+    /// extradata side data periodically.
+    private var lastSeenVideoExtradata: Data? = nil
+    /// Number of distinct in-band extradata changes seen this session.
+    private var codecParamChangeCount = 0
+
     /// Per-index discontinuity flag for live segments the cutter has opened.
     /// Mirrors `liveSegmentStartByIndex`'s lifetime: set when the segment
     /// opens, read + removed when the segment is reported to the provider.
@@ -1088,6 +1096,38 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // this knocks the residual leak rate down, matroska's
                 // per-packet side-data allocations were the missing
                 // piece beyond URLSession dispatch_data retention.
+                //
+                // Live exception: AV_PKT_DATA_NEW_EXTRADATA is inspected
+                // FIRST. A broadcast program boundary can change the video
+                // codec parameters (resolution / SPS / PPS), which the
+                // demuxer surfaces as in-band new-extradata side data. The
+                // fMP4 init segment was captured once at session start, so
+                // a real parameter change makes subsequent segments
+                // undecodable against the stale hvcC/avcC. Detect it,
+                // force a discontinuity cut (the tag at least resets
+                // AVPlayer's decoder at the seam), and log loudly: the
+                // full fix (versioned init.mp4 + per-discontinuity
+                // EXT-X-MAP) is gated on a real-world repro channel.
+                if isLive, packet.pointee.stream_index == videoStreamIndex {
+                    var sdSize: Int = 0
+                    if let sd = av_packet_get_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, &sdSize),
+                       sdSize > 0 {
+                        let newExtra = Data(bytes: sd, count: sdSize)
+                        if newExtra != lastSeenVideoExtradata {
+                            lastSeenVideoExtradata = newExtra
+                            codecParamChangeCount += 1
+                            pendingDiscontinuityFlag = true
+                            pendingForceCutFlag = true
+                            EngineLog.emit(
+                                "[HLSSegmentProducer] WARNING: in-band video extradata change #\(codecParamChangeCount) "
+                                + "(\(sdSize) bytes) at a live boundary. The init segment is from session "
+                                + "start; if this is a real SPS/resolution change, expect decode artifacts "
+                                + "until the versioned-init (EXT-X-MAP) path exists. Forcing a discontinuity cut.",
+                                category: .session
+                            )
+                        }
+                    }
+                }
                 av_packet_free_side_data(packet)
 
                 let pktStreamIdx = packet.pointee.stream_index
