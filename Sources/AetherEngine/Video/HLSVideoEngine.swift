@@ -344,6 +344,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// so currentTime/sourceTime don't jump while the old program is
     /// still on screen.
     var onPlaylistShiftRebased: (@Sendable (Double, Double) -> Void)?
+    /// Fires when the live source replayed itself from the beginning
+    /// after an unplanned reconnect (PumpExitReason.sourceReplay). The
+    /// engine cannot recover on the same URL; the host must re-negotiate
+    /// a fresh playback session (new transcode at the live edge) and
+    /// reload. Fires at most once per producer generation.
+    var onLiveSourceReset: (@Sendable () -> Void)?
     /// Session-long FLAC bridge for codecs that aren't legal in fMP4.
     /// Owned by the engine (not the producer) so that producer
     /// restarts on scrub don't lose the bridge's encoder state. The
@@ -1685,6 +1691,21 @@ public final class HLSVideoEngine: @unchecked Sendable {
         guard isLiveSession else { return }
         switch reason {
         case .stopRequested, .muxerFailed:
+            return
+        case .sourceReplay:
+            // The server restarted its stream from the beginning after a
+            // reconnect (Jellyfin transcode respawn). Reopening the same
+            // URL would replay the same content again, so the in-engine
+            // reopen path cannot recover this; only a fresh playback
+            // negotiation (new session / URL) gets back to the live edge.
+            // Hand it to the host and leave the session parked (AVPlayer
+            // drains its buffer while the host retunes).
+            EngineLog.emit(
+                "[HLSVideoEngine] live source replayed from start after reconnect; "
+                + "requesting host retune (fresh playback session)",
+                category: .session
+            )
+            onLiveSourceReset?()
             return
         case .eof, .readError, .keyframeStarvation:
             // A healthy live source never EOFs; treat it like a loss.

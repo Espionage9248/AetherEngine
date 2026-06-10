@@ -72,6 +72,15 @@ public final class Demuxer: @unchecked Sendable {
         avioProvider?.isSeekable ?? true
     }
 
+    /// Timestamp of the AVIO reader's last unplanned reconnect (drop or
+    /// stall, not a seek). Nil for non-HTTP sources or when no drop has
+    /// occurred. The live producer correlates this with a backward
+    /// source-PTS reset to detect a server that restarted its stream
+    /// from the beginning on re-GET (see `AVIOReader.lastUnplannedReconnectAt`).
+    var lastUnplannedSourceReconnectAt: Date? {
+        (avioProvider as? AVIOReader)?.lastUnplannedReconnectAt
+    }
+
     /// Open a media URL and probe its streams.
     ///
     /// `extraHeaders` are attached to every HTTP request the AVIO

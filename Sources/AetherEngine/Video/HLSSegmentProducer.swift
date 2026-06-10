@@ -345,6 +345,27 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var lastVideoSourceDts: Int64 = Int64.min
     private var lastAudioSourceDts: Int64 = Int64.min
 
+    /// First source dts ever seen per stream in THIS producer session.
+    /// Replay detection: after an unplanned reader reconnect, a backward
+    /// rebase whose target lands at or below this value (plus a small
+    /// window) means the server re-served the stream from its beginning
+    /// rather than continuing "from now". A genuine program-boundary PTS
+    /// reset lands at an arbitrary new origin and is NOT correlated with
+    /// a reconnect, so it never trips this.
+    private var firstSeenVideoSourceDts: Int64 = Int64.min
+    private var firstSeenAudioSourceDts: Int64 = Int64.min
+
+    /// How recently an unplanned reader reconnect must have happened for
+    /// a backward PTS reset to count as a server-side replay. The
+    /// reconnect and the first replayed packets arrive within seconds of
+    /// each other (the demuxer's internal buffering adds at most a few
+    /// seconds of old data in between).
+    private static let sourceReplayReconnectWindowSeconds: TimeInterval = 30
+
+    /// How close (in stream time) to the session's first-seen dts the
+    /// reset must land to count as a replay-from-start.
+    private static let sourceReplayStartWindowSeconds: Double = 10
+
     /// Per-frame fallback duration (in source video time_base) used
     /// to backfill the last packet of a fragment when the matroska
     /// demuxer doesn't supply `pkt->duration`. Defensive: most
@@ -615,6 +636,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
         /// starve forever, so the pump exits and lets the engine's
         /// reopen path retry with a fresh source connection.
         case keyframeStarvation
+        /// After an unplanned reader reconnect the source PTS reset back
+        /// to the session's start: the server restarted its stream from
+        /// the beginning on re-GET (Jellyfin transcode respawn re-serving
+        /// from byte 0). Stitching that in would splice REPLAYED content
+        /// into the live timeline (the user sees the program jump), and
+        /// reopening the same URL would replay it again, so the pump
+        /// exits terminally and the engine asks the host to re-negotiate
+        /// a fresh playback session at the live edge.
+        case sourceReplay
 
         var description: String {
             switch self {
@@ -623,6 +653,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             case .readError(let code): return "readError(\(code))"
             case .muxerFailed: return "muxerFailed"
             case .keyframeStarvation: return "keyframeStarvation"
+            case .sourceReplay: return "sourceReplay"
             }
         }
     }
@@ -645,6 +676,36 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// session. The byte scan is cheap (~µs per packet) but there's no
     /// reason to keep paying for it after detection.
     private var hdr10PlusDetected = false
+
+    /// Whether a live timeline jump is a server-side replay-from-start
+    /// rather than a genuine program boundary: the jump goes BACKWARD,
+    /// lands at (or below) the first dts this producer ever saw, and an
+    /// unplanned reader reconnect happened moments ago. All three must
+    /// hold; a program-boundary PTS reset is not reconnect-correlated,
+    /// and a reconnect that genuinely resumes "from now" produces no
+    /// backward jump. A continuation producer (post-reopen) starts
+    /// mid-stream, so a replay from the resource's byte 0 lands BELOW
+    /// its first-seen dts and still matches.
+    private func isSourceReplay(newDts: Int64,
+                                jumpTicks: Int64,
+                                firstSeenDts: Int64,
+                                tbSeconds: Double,
+                                stream: String) -> Bool {
+        guard jumpTicks < 0, firstSeenDts != Int64.min, tbSeconds > 0 else { return false }
+        guard let reconnectAt = demuxer.lastUnplannedSourceReconnectAt,
+              Date().timeIntervalSince(reconnectAt) < Self.sourceReplayReconnectWindowSeconds
+        else { return false }
+        let windowTicks = Int64(Self.sourceReplayStartWindowSeconds / tbSeconds)
+        guard newDts <= firstSeenDts + windowTicks else { return false }
+        EngineLog.emit(
+            "[HLSSegmentProducer] live source REPLAY detected on \(stream): "
+            + "srcDts=\(newDts) firstSeenDts=\(firstSeenDts) jumpTicks=\(jumpTicks) "
+            + "reconnect \(String(format: "%.1f", Date().timeIntervalSince(reconnectAt)))s ago; "
+            + "server restarted the stream from its beginning, exiting pump for host retune",
+            category: .session
+        )
+        return true
+    }
 
     // MARK: - Init
 
@@ -1267,6 +1328,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         ? Int64(Self.discontinuityThresholdSeconds / sourceVideoTbSeconds)
                         : Int64.max
                     if abs(jumpTicks) >= thresholdTicks {
+                        if isSourceReplay(newDts: packet.pointee.dts,
+                                          jumpTicks: jumpTicks,
+                                          firstSeenDts: firstSeenVideoSourceDts,
+                                          tbSeconds: sourceVideoTbSeconds,
+                                          stream: "video") {
+                            exitReason = .sourceReplay
+                            break readLoop
+                        }
                         let lastOutputDts = lastVideoSourceDts - videoShiftPts
                         let continuationDts = lastOutputDts + max(videoFallbackDurationPts, 1)
                         let newShift = packet.pointee.dts - continuationDts
@@ -1344,6 +1413,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         ? Int64(Self.discontinuityThresholdSeconds * Double(tb.den) / Double(tb.num))
                         : Int64.max
                     if abs(jumpTicks) >= thresholdTicks {
+                        if isSourceReplay(newDts: packet.pointee.dts,
+                                          jumpTicks: jumpTicks,
+                                          firstSeenDts: firstSeenAudioSourceDts,
+                                          tbSeconds: tb.den > 0
+                                              ? Double(tb.num) / Double(tb.den) : 0,
+                                          stream: "audio") {
+                            exitReason = .sourceReplay
+                            break readLoop
+                        }
                         // A fresh jump supersedes any pending correction from
                         // the PREVIOUS boundary; applying it later would shift
                         // audio by a stale delta.
@@ -1538,8 +1616,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 }
 
                 if isVideoPkt {
+                    if firstSeenVideoSourceDts == Int64.min {
+                        firstSeenVideoSourceDts = packet.pointee.dts
+                    }
                     lastVideoSourceDts = packet.pointee.dts
                 } else if isAudioPkt {
+                    if firstSeenAudioSourceDts == Int64.min {
+                        firstSeenAudioSourceDts = packet.pointee.dts
+                    }
                     lastAudioSourceDts = packet.pointee.dts
                 }
 

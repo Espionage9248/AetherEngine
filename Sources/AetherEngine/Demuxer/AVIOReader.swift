@@ -395,6 +395,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// under no lock; read by the same thread before the read path exits).
     private(set) var liveExhausted = false
 
+    /// Timestamp of the last UNPLANNED reconnect (connection drop or socket
+    /// stall, not a seek). The producer correlates this with a backward
+    /// source-PTS reset to detect a server that restarted its stream from
+    /// the beginning on re-GET (Jellyfin transcode respawn re-serving from
+    /// byte 0): the reader cannot see that at the byte level because the
+    /// 200-at-offset answer is indistinguishable from a legitimate "from
+    /// now" live rejoin. Demux-thread-only: written inside `readPersistent`
+    /// and read by the pump thread, which is the same thread (the AVIO read
+    /// callback executes synchronously inside `av_read_frame`).
+    private(set) var lastUnplannedReconnectAt: Date?
+
     init(url: URL, extraHeaders: [String: String] = [:], chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false) {
         self.url = url
         self.extraHeaders = extraHeaders
@@ -801,6 +812,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         return totalRead > 0 ? Int32(totalRead) : -1
                     }
                     EngineLog.emit("[AVIOReader] Persistent stall at offset \(frontier), reconnecting", category: .demux)
+                    lastUnplannedReconnectAt = Date()
                     backoffBeforeReconnect(streak: unproductiveReconnects, retryAfter: 0)
                     startPersistentConnection(at: frontier)
                 }
@@ -820,6 +832,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 return totalRead > 0 ? Int32(totalRead) : -1
             }
             EngineLog.emit("[AVIOReader] Persistent conn ended at offset \(frontier) status=\(status), reconnecting (streak=\(unproductiveReconnects) retryAfter=\(retryAfter)s)", category: .demux)
+            lastUnplannedReconnectAt = Date()
             backoffBeforeReconnect(streak: unproductiveReconnects, retryAfter: retryAfter)
             startPersistentConnection(at: frontier)
         }

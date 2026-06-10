@@ -163,6 +163,16 @@ public final class AetherEngine: ObservableObject {
     /// Seconds the playhead trails the live edge. 0 at the edge.
     @Published public private(set) var behindLiveSeconds: Double = 0
 
+    /// Fires when the live source server restarted its stream from the
+    /// beginning after a connection drop (e.g. a Jellyfin transcode
+    /// respawn re-serving from byte 0). The engine has parked the session
+    /// (playback drains the remaining buffer) and CANNOT recover on the
+    /// same URL: a reopen would replay the same content again. The host
+    /// must re-negotiate a fresh playback session (new transcode at the
+    /// live edge) and call `load` with the new URL. Event-only (no
+    /// replay): subscribe per session.
+    public let liveSourceReset = PassthroughSubject<Void, Never>()
+
     // MARK: - Output
 
     /// How the AVPlayer surface fills its container layer. Mirrors
@@ -1582,6 +1592,15 @@ public final class AetherEngine: ObservableObject {
                     // program boundaries, far outside any real window.
                     self.liveShiftSeams.removeFirst(self.liveShiftSeams.count - 64)
                 }
+            }
+        }
+        session.onLiveSourceReset = { [weak self, weak session] in
+            Task { @MainActor in
+                // A stale session (superseded by a zap) must not trigger a
+                // retune of whatever is playing now.
+                guard let self, let session,
+                      self.nativeVideoSession === session else { return }
+                self.liveSourceReset.send()
             }
         }
         // AVPlayer HLS playback over the loopback HTTP server. Detach
