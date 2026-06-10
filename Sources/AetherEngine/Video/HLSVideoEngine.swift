@@ -943,6 +943,33 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
         if audioStreamIndex >= 0, let audioStream = dem.stream(at: audioStreamIndex) {
             let codecID = audioStream.pointee.codecpar.pointee.codec_id
+            // A live MPEG-TS probe can return an AAC stream with EMPTY
+            // codec parameters: find_stream_info gave up before decoding
+            // an audio frame ("Could not find codec parameters for stream
+            // 1 ... unspecified sample format"; device repro: KiKA). With
+            // sample_rate 0 the ASC synthesis below bails, the stream-copy
+            // header write fails, the bridge cannot initialise either, and
+            // the session silently degrades to video-only. Fill the
+            // de-facto live defaults instead: Jellyfin live transcodes pin
+            // their audio output to 48 kHz stereo AAC-LC in the request
+            // they generate, and DVB/IPTV ADTS is 48 kHz stereo in
+            // practice. If a source ever deviates, audio pitch will be
+            // off and this log line is the breadcrumb.
+            if isLiveSession, codecID == AV_CODEC_ID_AAC,
+               audioStream.pointee.codecpar.pointee.sample_rate == 0 {
+                audioStream.pointee.codecpar.pointee.sample_rate = 48000
+                if audioStream.pointee.codecpar.pointee.ch_layout.nb_channels <= 0 {
+                    av_channel_layout_default(&audioStream.pointee.codecpar.pointee.ch_layout, 2)
+                }
+                if audioStream.pointee.codecpar.pointee.profile < 0 {
+                    audioStream.pointee.codecpar.pointee.profile = 1  // FF_PROFILE_AAC_LOW
+                }
+                EngineLog.emit(
+                    "[HLSVideoEngine] audio: AAC stream had no codec parameters from the live "
+                    + "probe; assuming 48 kHz stereo AAC-LC (Jellyfin live transcode default)",
+                    category: .session
+                )
+            }
             let compat = AudioCodecCompat.from(codecID)
             // HE-AAC (SBR, profile 4) / HE-AACv2 (PS, profile 28) cannot take
             // the ADTS stream-copy path: ADTS signals only the LC core (SBR

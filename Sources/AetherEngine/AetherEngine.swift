@@ -2587,7 +2587,10 @@ public final class AetherEngine: ObservableObject {
                 try await loadSoftware(
                     url: url,
                     sourceHTTPHeaders: loadedOptions.httpHeaders,
-                    startPosition: resumeAt > 1 ? resumeAt : nil,
+                    // Live rejoins at the live edge; a stale playhead
+                    // resume position is meaningless against the fresh
+                    // source connection.
+                    startPosition: loadedOptions.isLive ? nil : (resumeAt > 1 ? resumeAt : nil),
                     audioSourceStreamIndex: audioStreamIndex,
                     isLive: loadedOptions.isLive,
                     dvrWindowSeconds: loadedOptions.dvrWindowSeconds,
@@ -2610,12 +2613,21 @@ public final class AetherEngine: ObservableObject {
                 try await loadNative(
                     url: url,
                     sourceHTTPHeaders: loadedOptions.httpHeaders,
-                    startPosition: resumeAt > 1 ? resumeAt : nil,
+                    // Live rejoins at the live edge (see loadSoftware above).
+                    startPosition: loadedOptions.isLive ? nil : (resumeAt > 1 ? resumeAt : nil),
                     audioSourceStreamIndex: audioStreamIndex,
                     keepDvh1TagWithoutDV: loadedOptions.keepDvh1TagWithoutDV,
                     matchContentEnabled: loadedOptions.matchContentEnabled,
                     panelIsInHDRMode: loadedOptions.panelIsInHDRMode,
                     audioBridgeMode: loadedOptions.audioBridgeMode,
+                    // Without these the audio-switch reload of a LIVE session
+                    // rebuilt the pipeline as VOD: the demuxer opened in
+                    // streaming mode (no live reconnect machinery) and
+                    // HLSVideoEngine ran the duration guard against a 0-length
+                    // source, failing the whole switch with "cannot build
+                    // segment plan" (device repro: KiKA).
+                    isLive: loadedOptions.isLive,
+                    dvrWindowSeconds: loadedOptions.dvrWindowSeconds,
                     preopenedDemuxer: customPreopened,
                     generation: gen
                 )
