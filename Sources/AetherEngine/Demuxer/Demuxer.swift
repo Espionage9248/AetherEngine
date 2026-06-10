@@ -435,7 +435,12 @@ public final class Demuxer: @unchecked Sendable {
            let extradata = codecpar.pointee.extradata,
            codecpar.pointee.extradata_size > 0 {
             let bytes = Data(bytes: extradata, count: Int(codecpar.pointee.extradata_size))
-            assHeader = String(data: bytes, encoding: .utf8)
+            // Strip NUL bytes: MKV CodecPrivate is frequently
+            // NUL-terminated, and downstream consumers (libass parses
+            // C-string-style) silently stop at the first NUL, hiding
+            // anything a host appends after the header.
+            assHeader = String(data: bytes, encoding: .utf8)?
+                .replacingOccurrences(of: "\0", with: "")
         }
 
         return TrackInfo(

@@ -26,12 +26,48 @@ struct ASSScriptBuilderTests {
         #expect(script.contains("Dialogue: 0,0:01:01.50,0:01:03.88,Default,,0,0,0,,Hello {\\i1}there{\\i0}"))
     }
 
-    @Test("Dedupes by ReadOrder across re-emits")
-    func readOrderDedupe() {
+    @Test("Dedupes identical re-emits by content")
+    func contentDedupe() {
         let b = ASSScriptBuilder(header: header)
         #expect(b.add(rawEventText: "7,0,Default,,0,0,0,,First", start: 1, end: 2))
         #expect(!b.add(rawEventText: "7,0,Default,,0,0,0,,First", start: 1, end: 2))
         #expect(b.eventCount == 1)
+    }
+
+    @Test("Keeps distinct events that share a ReadOrder")
+    func sharedReadOrderKept() {
+        // Real files ship ReadOrder hardcoded to 0 on every line; the
+        // whole track must not collapse to one event (field repro).
+        let b = ASSScriptBuilder(header: header)
+        #expect(b.add(rawEventText: "0,,Default,,0,0,0,,Erste Zeile", start: 1, end: 2))
+        #expect(b.add(rawEventText: "0,,Default,,0,0,0,,Zweite Zeile", start: 3, end: 4))
+        #expect(b.eventCount == 2)
+        let script = b.script()
+        #expect(script.contains(",Erste Zeile"))
+        #expect(script.contains(",Zweite Zeile"))
+    }
+
+    @Test("Strips NUL bytes from the header")
+    func nulStrippedHeader() {
+        // MKV CodecPrivate is frequently NUL-terminated; libass parses
+        // C-string-style and would ignore everything after the NUL.
+        let b = ASSScriptBuilder(header: "[Script Info]\r\nPlayResX: 960\r\n\u{0000}")
+        b.add(rawEventText: "0,0,Default,,0,0,0,,Hi", start: 0, end: 1)
+        let script = b.script()
+        #expect(!script.contains("\u{0000}"))
+        #expect(script.contains("[Events]"))
+        #expect(script.contains("Dialogue: 0,"))
+    }
+
+    @Test("Orders events by cue start time")
+    func orderedByStart() {
+        let b = ASSScriptBuilder(header: header)
+        b.add(rawEventText: "0,,Default,,0,0,0,,Later", start: 10, end: 11)
+        b.add(rawEventText: "0,,Default,,0,0,0,,Earlier", start: 5, end: 6)
+        let script = b.script()
+        let earlier = script.range(of: ",Earlier")!.lowerBound
+        let later = script.range(of: ",Later")!.lowerBound
+        #expect(earlier < later)
     }
 
     @Test("Splits multi-line cue bodies into separate events")
@@ -77,15 +113,15 @@ struct ASSScriptBuilderTests {
         #expect(earlier < later)
     }
 
-    @Test("Empty builder renders just the header; first emission wins on duplicate ReadOrder")
-    func emptyAndFirstWins() {
+    @Test("Empty builder renders just the header; distinct content with the same ReadOrder is kept")
+    func emptyAndDistinctContent() {
         let b = ASSScriptBuilder(header: header)
         #expect(b.script() == header)
         b.add(rawEventText: "6,0,Default,,0,0,0,,Original", start: 1, end: 2)
         b.add(rawEventText: "6,0,Default,,0,0,0,,Changed", start: 9, end: 10)
         let script = b.script()
         #expect(script.contains(",Original"))
-        #expect(!script.contains(",Changed"))
+        #expect(script.contains(",Changed"))
     }
 
     @Test("Synthesizes the Events section when the header lacks it")
