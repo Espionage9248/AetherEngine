@@ -58,9 +58,24 @@ public final class ASSScriptBuilder {
 
     /// The full script: header, then all known events ordered by
     /// ReadOrder.
+    ///
+    /// MKV codec private data usually ends after the last `Style:`
+    /// line WITHOUT an `[Events]` section (mkvmerge and friends strip
+    /// it together with the events). Appending `Dialogue:` lines
+    /// straight after such a header leaves them inside `[V4+ Styles]`
+    /// and libass parses 0 events (field repro: "Added subtitle file:
+    /// <memory> (2 styles, 0 events)"). Synthesize the section plus
+    /// the standard Format line whenever the header lacks it.
     public func script() -> String {
         var lines = [header]
-        lines.reserveCapacity(events.count + 1)
+        lines.reserveCapacity(events.count + 2)
+        if !header.contains("[Events]") {
+            lines.append("""
+
+            [Events]
+            Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+            """)
+        }
         for (_, line) in events.sorted(by: { $0.key < $1.key }) {
             lines.append(line)
         }

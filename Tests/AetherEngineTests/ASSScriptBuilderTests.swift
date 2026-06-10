@@ -87,4 +87,40 @@ struct ASSScriptBuilderTests {
         #expect(script.contains(",Original"))
         #expect(!script.contains(",Changed"))
     }
+
+    @Test("Synthesizes the Events section when the header lacks it")
+    func missingEventsSection() {
+        // MKV codec private data usually ends after the last Style line
+        // (no [Events] section); without synthesizing one, Dialogue
+        // lines land inside [V4+ Styles] and libass parses 0 events.
+        let bareHeader = """
+        [Script Info]
+        PlayResX: 960
+
+        [V4+ Styles]
+        Format: Name, Fontname, Fontsize
+        Style: Default,sans-serif,47
+        """
+        let b = ASSScriptBuilder(header: bareHeader)
+        b.add(rawEventText: "1,0,Default,,0,0,0,,Hi", start: 0, end: 1)
+        let script = b.script()
+        let eventsRange = script.range(of: "[Events]")
+        let formatRange = script.range(of: "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text")
+        let dialogueRange = script.range(of: "Dialogue: 0,")
+        #expect(eventsRange != nil)
+        #expect(formatRange != nil)
+        #expect(dialogueRange != nil)
+        if let e = eventsRange, let f = formatRange, let d = dialogueRange {
+            #expect(e.lowerBound < f.lowerBound)
+            #expect(f.lowerBound < d.lowerBound)
+        }
+    }
+
+    @Test("Does not duplicate an existing Events section")
+    func existingEventsSection() {
+        let b = ASSScriptBuilder(header: header)  // suite header HAS [Events]
+        b.add(rawEventText: "1,0,Default,,0,0,0,,Hi", start: 0, end: 1)
+        let script = b.script()
+        #expect(script.components(separatedBy: "[Events]").count == 2)
+    }
 }
