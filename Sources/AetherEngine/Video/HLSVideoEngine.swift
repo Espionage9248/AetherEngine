@@ -1462,12 +1462,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// byte copy makes window-slide eviction harmless: if the file
     /// vanishes between lookup and read, this returns nil and the
     /// preview falls back to time-only. Synchronous local file I/O on a
-    /// 1-3 MB file; call off-main. `initSegment()` returns instantly
-    /// here because a scrubbing session produced init.mp4 long ago.
+    /// 1-3 MB file; call off-main. `segmentIndex` lets the caller
+    /// dedupe repeat probes into the same segment (extractor reuse).
     func liveScrubThumbnailSource(atSeconds seconds: Double) -> (data: Data, startSeconds: Double, segmentIndex: Int)? {
-        guard isLiveSession, let prov = provider else { return nil }
+        // Snapshot provider under restartLock -- mirrors the live-reopen
+        // path's convention (stop() writes provider = nil under the same
+        // lock), keeping this unsynchronized off-main read safe.
+        restartLock.lock()
+        let prov = provider
+        restartLock.unlock()
+        guard isLiveSession, let prov else { return nil }
         guard let seg = prov.liveThumbnailSegment(atSeconds: seconds) else { return nil }
-        guard let initData = prov.initSegment(),
+        guard let initData = prov.peekInitSegment(),
               let segData = try? Data(contentsOf: seg.fileURL) else { return nil }
         return (initData + segData, seg.startSeconds, seg.index)
     }
@@ -3337,17 +3343,16 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
         return _liveFirstVisible
     }
 
-    // MARK: - HLSSegmentProvider
-
-    func initSegment() -> Data? {
-        return cache.fetchInit(timeout: 30.0)
-    }
+    // MARK: - Thumbnail lookup (engine-internal)
 
     /// Pure lookup for the live scrub-thumbnail path: the segment whose
     /// [start, start+duration) span contains `seconds`, plus its cache
     /// file URL. NO side effects: unlike `mediaSegmentURL(at:)` this must
     /// not extend the visible window or trigger a producer restart; a
     /// thumbnail probe outside the resident window simply returns nil.
+    /// A probe at or past the end of the last finalized segment (the live
+    /// edge) returns nil by design; the consumer treats nil as time-only
+    /// fallback.
     func liveThumbnailSegment(atSeconds seconds: Double) -> (index: Int, startSeconds: Double, fileURL: URL)? {
         guard isLive else { return nil }
         stateLock.lock()
@@ -3358,6 +3363,19 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
         }) else { return nil }
         guard let url = cache.peekURL(index: idx) else { return nil }
         return (idx, segs[idx].startSeconds, url)
+    }
+
+    /// Non-blocking init.mp4 peek for the thumbnail path. The blocking
+    /// `initSegment()` (30s) is for the HTTP server, where waiting on the
+    /// muxer is the backpressure model; a cosmetic preview must not park.
+    func peekInitSegment() -> Data? {
+        cache.fetchInit(timeout: 0)
+    }
+
+    // MARK: - HLSSegmentProvider
+
+    func initSegment() -> Data? {
+        return cache.fetchInit(timeout: 30.0)
     }
 
     /// File URL for a cached segment without materializing any bytes.
