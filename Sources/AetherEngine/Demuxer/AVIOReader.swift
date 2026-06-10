@@ -699,13 +699,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 position += Int64(toCopy)
                 totalRead += toCopy
 
-                // Trim consumed data to prevent unbounded memory growth
-                // Keep last 1MB for potential small backward seeks
+                // Trim consumed data to prevent unbounded memory growth.
+                // Keep last 1MB for potential small backward seeks.
+                // subdata, not removeFirst: removeFirst leaves the slice's
+                // backing storage growing with total streamed bytes (see
+                // trimWindowLocked for the full mechanism).
                 streamLock.lock()
                 let consumed = Int(position - streamBytesRead)
                 if consumed > Self.streamTrimThreshold {
                     let trimAmount = consumed - Self.streamTrimThreshold
-                    streamBuffer.removeFirst(trimAmount)
+                    streamBuffer = streamBuffer.subdata(in: trimAmount..<streamBuffer.count)
                     streamBytesRead += Int64(trimAmount)
                 }
                 streamLock.unlock()
@@ -857,12 +860,28 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// the cursor exceeds the lookback by a full batch, so the front-drop
     /// runs in ~`winTrimBatch` steps instead of on every read. Caller holds
     /// `winCond`.
+    ///
+    /// The trim MUST re-base into fresh storage (`subdata`), never
+    /// `removeFirst`. `Data.removeFirst` only advances the slice's lower
+    /// bound; the backing `__DataStorage` stays addressed from its origin,
+    /// and the `count.setter` growth in `appendPersistentData` reallocates
+    /// it to fit the slice's ever-increasing upper bound. Net effect: the
+    /// allocation grows with every byte ever streamed through the
+    /// connection even though `window.count` holds at ~20 MB. On an
+    /// 80 Mbps remux this leaked ~14 MB/s into one realloc block until
+    /// jetsam (AetherEngine#31, Instruments stack: appendPersistentData →
+    /// Data count.setter → ensureUniqueBufferReference(growingTo:);
+    /// verified standalone: 512 MB streamed through a 20 MB
+    /// removeFirst-trimmed window = +513 MB footprint, subdata re-base =
+    /// +9 MB flat). `subdata` copies the live ~18 MB into a compact buffer
+    /// and releases the old storage; at the ~4 MB batch cadence that is a
+    /// few cheap memcpys per second.
     private func trimWindowLocked() {
         let behind = Int(position - winStart)
         let dropThreshold = Self.winLookback + Self.winTrimBatch
         if behind > dropThreshold {
             let drop = behind - Self.winLookback
-            window.removeFirst(drop)
+            window = window.subdata(in: drop..<window.count)
             winStart += Int64(drop)
         }
     }
