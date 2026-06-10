@@ -1937,22 +1937,27 @@ public final class AetherEngine: ObservableObject {
     private func clampLiveResumeIfBehindWindow() {
         guard isLive, let w = liveWindow else { return }
         let margin: Double = 5
-        let target: Double?
         if let win = w.windowSeconds {
-            target = w.behindLiveSeconds > (win - margin)
-                ? (w.seekableRange?.lowerBound ?? w.edgeTime) + margin
-                : nil
+            guard w.behindLiveSeconds > (win - margin) else { return }
+            let t = (w.seekableRange?.lowerBound ?? w.edgeTime) + margin
+            EngineLog.emit(
+                "[AetherEngine] live resume clamp: behind=\(String(format: "%.1f", w.behindLiveSeconds))s "
+                + "window=\(String(format: "%.0f", win)) -> seek \(String(format: "%.1f", t))",
+                category: .session
+            )
+            Task { await self.seek(to: t) }
         } else {
-            target = w.behindLiveSeconds > 45 ? w.edgeTime : nil
+            // Live-only: seek(to:) refuses targets without a DVR window,
+            // so route through the edge snap (which drives the host
+            // directly).
+            guard w.behindLiveSeconds > 45 else { return }
+            EngineLog.emit(
+                "[AetherEngine] live resume clamp: behind=\(String(format: "%.1f", w.behindLiveSeconds))s "
+                + "window=live-only -> edge snap",
+                category: .session
+            )
+            Task { await self.seekToLiveEdge() }
         }
-        guard let t = target else { return }
-        EngineLog.emit(
-            "[AetherEngine] live resume clamp: behind=\(String(format: "%.1f", w.behindLiveSeconds))s "
-            + "window=\(w.windowSeconds.map { String(format: "%.0f", $0) } ?? "live-only") "
-            + "-> seek \(String(format: "%.1f", t))",
-            category: .session
-        )
-        Task { await self.seek(to: t) }
     }
 
     public func pause() {
@@ -2159,6 +2164,26 @@ public final class AetherEngine: ObservableObject {
     /// resolves to `behind = 0` -> `clockTarget = seekableEnd`, i.e. the edge.
     public func seekToLiveEdge() async {
         guard isLive, let w = liveWindow else { return }
+        // Live-only (no DVR window): seek(to:) refuses every target since
+        // there is no rewind range, but snapping TO the edge is always
+        // legal — and it is the recovery move after a long pause leaves
+        // the playhead on evicted content. Drive the native host directly
+        // at its own seekable end (the SW live-only path has no ring and
+        // plays at the edge by construction; nothing to do there).
+        guard w.windowSeconds != nil else {
+            if let host = nativeHost {
+                let clockTarget = max(0, host.seekableEnd)
+                EngineLog.emit(
+                    "[AetherEngine] live-only edge snap: clockTarget=\(String(format: "%.1f", clockTarget))",
+                    category: .engine
+                )
+                host.seek(to: clockTarget)
+                nativeClockSeconds = clockTarget
+                currentTime = clockTarget + playlistShiftSeconds
+                sourceTime = currentTime
+            }
+            return
+        }
         await seek(to: w.edgeTime)
     }
 

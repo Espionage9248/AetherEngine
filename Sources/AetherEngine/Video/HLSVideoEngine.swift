@@ -296,6 +296,47 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// its own published shift in step so the subtitle overlay's cue
     /// lookup uses the right source-time conversion.
     var onPlaylistShiftChanged: (@Sendable (Double) -> Void)?
+
+    /// Engine-owned deep copy of an AVCodecParameters. The saved
+    /// video/audio configs previously held raw pointers INTO the
+    /// session demuxer's AVStreams; a live reopen closes that demuxer
+    /// (avformat_close_input frees the streams and their codecpar)
+    /// while the continuation producer still dereferences the config
+    /// lazily on its pump thread (muxer allocation copies the params),
+    /// i.e. a use-after-free on every successful reopen. Deep-copying
+    /// at capture time decouples the configs from any demuxer's
+    /// lifetime. Freed by ARC via deinit; `stop()`'s detached cleanup
+    /// captures the boxes so they outlive the pump's unwind.
+    final class OwnedCodecParameters: @unchecked Sendable {
+        let ptr: UnsafeMutablePointer<AVCodecParameters>
+
+        init?(copying src: UnsafePointer<AVCodecParameters>) {
+            guard let copy = avcodec_parameters_alloc() else { return nil }
+            guard avcodec_parameters_copy(copy, src) >= 0 else {
+                var c: UnsafeMutablePointer<AVCodecParameters>? = copy
+                avcodec_parameters_free(&c)
+                return nil
+            }
+            self.ptr = copy
+        }
+
+        deinit {
+            var p: UnsafeMutablePointer<AVCodecParameters>? = ptr
+            avcodec_parameters_free(&p)
+        }
+    }
+
+    /// The owned copies backing `savedVideoConfig` / `savedAudioConfig`.
+    /// Guarded by `restartLock` alongside the configs themselves.
+    private var ownedCodecParams: [OwnedCodecParameters] = []
+
+    /// Demuxer of an in-flight live reopen attempt, registered before its
+    /// (potentially long-blocking) open so `stop()` can abort it. Without
+    /// this, a reopen blocked in the AVIO reconnect loop against a dead
+    /// tuner survives a channel zap and keeps reconnecting into the next
+    /// session — the same orphan class the probe-abort hook fixed for
+    /// `load()`. Guarded by `restartLock`.
+    private var reopenDemuxer: Demuxer?
     /// Fires when a live program-boundary rebase changes the shift.
     /// Carries (newShiftSeconds, seamOutputSeconds): AetherEngine queues
     /// the new shift and applies it to its published clock only when
@@ -811,8 +852,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
         } else {
             p5ColorOverride = nil
         }
+        // Deep-copy the codec parameters out of the demuxer's stream so
+        // the config survives the demuxer (live reopen closes it while
+        // the continuation producer still reads the config; see
+        // OwnedCodecParameters).
+        guard let ownedVideoParams = OwnedCodecParameters(copying: codecpar) else {
+            throw HLSVideoEngineError.openFailed(reason: "codecpar copy failed")
+        }
+        ownedCodecParams.append(ownedVideoParams)
         let videoConfig = HLSSegmentProducer.StreamConfig(
-            codecpar: codecpar,
+            codecpar: UnsafePointer(ownedVideoParams.ptr),
             timeBase: videoTimeBase,
             codecTagOverride: codecTagOverride,
             stripDolbyVisionMetadata: stripDolbyVisionMetadata,
@@ -928,8 +977,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
                         category: .session
                     )
                 }
+                // Deep-copy AFTER prepareAACForFMP4 so the synthesized ASC
+                // extradata is included; same demuxer-lifetime decoupling
+                // as the video config (see OwnedCodecParameters). The
+                // bridge path is unaffected: bridge.encoderCodecpar is
+                // bridge-owned and the bridge lives on the engine.
+                guard let ownedAudioParams = OwnedCodecParameters(copying: audioStream.pointee.codecpar) else {
+                    throw HLSVideoEngineError.openFailed(reason: "audio codecpar copy failed")
+                }
+                ownedCodecParams.append(ownedAudioParams)
                 streamCopyAudio = HLSSegmentProducer.AudioConfig(
-                    codecpar: audioStream.pointee.codecpar,
+                    codecpar: UnsafePointer(ownedAudioParams.ptr),
                     timeBase: audioStream.pointee.time_base,
                     sourceStreamIndex: audioStreamIndex,
                     inputTimeBase: audioStream.pointee.time_base,
@@ -1414,8 +1472,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
         provider = nil
         savedVideoConfig = nil
         savedAudioConfig = nil
+        // The owned codecpar copies must outlive the pump's unwind (the
+        // muxer reads them); hand them to the detached cleanup, which
+        // releases them after waitForFinish.
+        let ownedParams = ownedCodecParams
+        ownedCodecParams = []
+        // Abort a live-reopen attempt blocked in Demuxer.open: markClosed
+        // is lock-free, the reopen loop unwinds via its identity guards.
+        let reopening = reopenDemuxer
+        reopenDemuxer = nil
         segmentPlan = []
         restartLock.unlock()
+        reopening?.markClosed()
 
         // Send the cancel signal synchronously so the pump starts
         // unwinding immediately. waitForFinish + the rest of the
@@ -1453,6 +1521,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             ab?.close()
             d?.close()
             preopened?.close()
+            // Release the owned codecpar copies last: the pump (now
+            // finished or abandoned) read them via the saved configs.
+            _ = ownedParams
         }
     }
 
@@ -1631,6 +1702,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
 
             let dem = Demuxer()
+            // Register before the blocking open so stop() can abort it
+            // (markClosed); deregister identity-guarded below.
+            registerReopenDemuxer(dem)
+            defer { unregisterReopenDemuxer(dem) }
             do {
                 try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, isLive: true)
             } catch {
@@ -1676,6 +1751,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
         restartLock.lock()
         defer { restartLock.unlock() }
         return producer === p
+    }
+
+    private func registerReopenDemuxer(_ dem: Demuxer) {
+        restartLock.lock()
+        reopenDemuxer = dem
+        restartLock.unlock()
+    }
+
+    private func unregisterReopenDemuxer(_ dem: Demuxer) {
+        restartLock.lock()
+        if reopenDemuxer === dem { reopenDemuxer = nil }
+        restartLock.unlock()
     }
 
     private enum LiveReopenOutcome { case done, aborted, retry }
