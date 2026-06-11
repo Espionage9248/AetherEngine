@@ -321,17 +321,5 @@ final class DisplayCriteriaController {
             .first
     }
 
-    private func fourccString(_ code: FourCharCode) -> String {
-        let bytes: [UInt8] = [
-            UInt8((code >> 24) & 0xff),
-            UInt8((code >> 16) & 0xff),
-            UInt8((code >> 8) & 0xff),
-            UInt8(code & 0xff),
-        ]
-        let chars = bytes.map { (b: UInt8) -> Character in
-            (b >= 0x20 && b < 0x7f) ? Character(UnicodeScalar(b)) : "."
-        }
-        return String(chars)
-    }
     #endif
 }

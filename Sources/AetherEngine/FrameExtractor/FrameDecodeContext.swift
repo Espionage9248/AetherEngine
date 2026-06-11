@@ -33,7 +33,7 @@ final class FrameDecodeContext: @unchecked Sendable {
     /// PQ (ST 2084) and HLG transfers mean the decoded frame is HDR and
     /// needs tone-mapping to SDR before display as a thumbnail.
     static func isHDRTransfer(_ trc: AVColorTransferCharacteristic) -> Bool {
-        return trc == AVCOL_TRC_SMPTE2084 || trc == AVCOL_TRC_ARIB_STD_B67
+        ColorAttachments.isHDRTransfer(trc)
     }
 
     init(url: URL, httpHeaders: [String: String]) {

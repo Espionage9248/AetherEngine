@@ -177,11 +177,11 @@ final class SegmentCache {
         }
 
         condition.lock()
-        defer { condition.unlock() }
         // Close contract: a store racing close() from a still-unwinding
         // pump must not resurrect bookkeeping on a closed cache (the
         // entry would point into the deleted session dir).
         guard !closed else {
+            condition.unlock()
             try? FileManager.default.removeItem(at: fileURL)
             return
         }
@@ -198,8 +198,10 @@ final class SegmentCache {
             _totalBytes += data.count
             if index > _highestStoredIndex { _highestStoredIndex = index }
         }
-        pruneOutsideWindow()
+        let doomed = pruneOutsideWindow()
         condition.broadcast()
+        condition.unlock()
+        for url in doomed { try? FileManager.default.removeItem(at: url) }
     }
 
     /// Adopt a fully-written staging file as the cache entry for
@@ -232,10 +234,10 @@ final class SegmentCache {
         }
 
         condition.lock()
-        defer { condition.unlock() }
         // Same close contract as store(): drop the adopted file instead
         // of resurrecting bookkeeping on a closed cache.
         guard !closed else {
+            condition.unlock()
             try? FileManager.default.removeItem(at: fileURL)
             return
         }
@@ -248,8 +250,10 @@ final class SegmentCache {
             _totalBytes += byteCount
             if index > _highestStoredIndex { _highestStoredIndex = index }
         }
-        pruneOutsideWindow()
+        let doomed = pruneOutsideWindow()
         condition.broadcast()
+        condition.unlock()
+        for url in doomed { try? FileManager.default.removeItem(at: url) }
     }
 
     func close() {
@@ -280,12 +284,14 @@ final class SegmentCache {
     /// evicts-its-own-output race window opens.
     func declareTarget(_ index: Int) {
         condition.lock()
-        defer { condition.unlock() }
+        var doomed: [URL] = []
         if index != currentTargetIndex {
             currentTargetIndex = index
-            pruneOutsideWindow()
+            doomed = pruneOutsideWindow()
             condition.broadcast()
         }
+        condition.unlock()
+        for url in doomed { try? FileManager.default.removeItem(at: url) }
     }
 
     /// Non-blocking lookup. Returns the segment bytes via mmap; the
@@ -374,11 +380,19 @@ final class SegmentCache {
     /// the firstVisible cutoff is the tighter of the two on the back side).
     func evictBelow(_ cutoff: Int) {
         condition.lock()
-        defer { condition.unlock() }
+        var doomed: [URL] = []
         for (k, url) in entries where k < cutoff {
             _totalBytes -= entryBytes[k] ?? byteSize(of: url)
             entryBytes.removeValue(forKey: k)
             entries.removeValue(forKey: k)
+            doomed.append(url)
+        }
+        condition.unlock()
+        // File deletion OFF the condition lock: removeItem is filesystem
+        // I/O and sits directly on the segment-serve hot path (fetch
+        // waiters + the pump's backpressure wait park on this condition).
+        // Same pattern as PacketRingBuffer's eviction.
+        for url in doomed {
             try? FileManager.default.removeItem(at: url)
         }
     }
@@ -486,7 +500,7 @@ final class SegmentCache {
     /// currentTarget + forwardWindow]`. Bounds the on-disk cache to a
     /// fixed segment window centred on AVPlayer's declared target.
     /// Must be called with `condition` held.
-    private func pruneOutsideWindow() {
+    private func pruneOutsideWindow() -> [URL] {
         let lo = currentTargetIndex - backwardWindow
         // Forward bound: keep forwardWindow ahead of the target, but never
         // evict segments the current producer already wrote. A transient
@@ -505,14 +519,22 @@ final class SegmentCache {
         // can only exceed target+forwardWindow transiently during a backward
         // dip, by at most the dip distance.
         let hi = max(currentTargetIndex + forwardWindow, _highestStoredIndex)
+        var doomed: [URL] = []
         for (k, url) in entries {
             if k < lo || k > hi {
                 _totalBytes -= entryBytes[k] ?? byteSize(of: url)
                 entryBytes.removeValue(forKey: k)
                 entries.removeValue(forKey: k)
-                try? FileManager.default.removeItem(at: url)
+                doomed.append(url)
             }
         }
+        // Collected under the lock, deleted by the caller AFTER
+        // unlocking: removeItem is filesystem I/O on the segment-serve
+        // hot path (fetch waiters + the pump's backpressure wait park on
+        // this condition; PacketRingBuffer's eviction uses the same
+        // pattern). A racing reader that still resolves a doomed URL
+        // degrades to an mmap miss -> nil, same as before.
+        return doomed
     }
 
     /// Read a segment file as mmap-backed Data. The kernel pages in

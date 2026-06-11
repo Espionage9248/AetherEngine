@@ -45,3 +45,40 @@ enum VideoDecoderError: Error, LocalizedError {
         }
     }
 }
+
+/// FFmpeg-to-CoreVideo color metadata mapping shared by the SW and HW
+/// video decoders (and the HDR gates elsewhere). One source of truth:
+/// a new primaries/transfer case (P3-DCI, BT.601, ...) lands in every
+/// pipeline at once instead of drifting between hand-kept copies.
+enum ColorAttachments {
+    static func primaries(_ v: AVColorPrimaries) -> CFString? {
+        switch v {
+        case AVCOL_PRI_BT709:    kCVImageBufferColorPrimaries_ITU_R_709_2
+        case AVCOL_PRI_BT2020:   kCVImageBufferColorPrimaries_ITU_R_2020
+        case AVCOL_PRI_SMPTE432: kCVImageBufferColorPrimaries_P3_D65
+        default:                 nil
+        }
+    }
+
+    static func transfer(_ v: AVColorTransferCharacteristic) -> CFString? {
+        switch v {
+        case AVCOL_TRC_BT709:        kCVImageBufferTransferFunction_ITU_R_709_2
+        case AVCOL_TRC_SMPTE2084:    kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
+        case AVCOL_TRC_ARIB_STD_B67: kCVImageBufferTransferFunction_ITU_R_2100_HLG
+        default:                     nil
+        }
+    }
+
+    static func matrix(_ v: AVColorSpace) -> CFString? {
+        switch v {
+        case AVCOL_SPC_BT709:                       kCVImageBufferYCbCrMatrix_ITU_R_709_2
+        case AVCOL_SPC_BT2020_NCL, AVCOL_SPC_BT2020_CL: kCVImageBufferYCbCrMatrix_ITU_R_2020
+        default:                                    nil
+        }
+    }
+
+    /// PQ (ST 2084) or HLG transfer means the stream is HDR.
+    static func isHDRTransfer(_ trc: AVColorTransferCharacteristic) -> Bool {
+        trc == AVCOL_TRC_SMPTE2084 || trc == AVCOL_TRC_ARIB_STD_B67
+    }
+}

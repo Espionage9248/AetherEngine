@@ -73,10 +73,10 @@ func runHLSFixture(args: [String]) -> Int32 {
     let inputPath = rest.removeFirst()
 
     // Flags.
-    let port          = takeIntArg("--port",             from: &rest) ?? 8090
-    let segSeconds    = takeIntArg("--segment-seconds",  from: &rest) ?? 4
-    let discAt        = takeIntArg("--discontinuity-at", from: &rest)
-    let dropSeg       = takeIntArg("--drop-segment",     from: &rest)
+    let port          = takeIntFlag("--port", from: &rest) ?? 8090
+    let segSeconds    = takeIntFlag("--segment-seconds", from: &rest) ?? 4
+    let discAt        = takeIntFlag("--discontinuity-at", from: &rest)
+    let dropSeg       = takeIntFlag("--drop-segment", from: &rest)
     let withMaster    = takeFlag("--master",       from: &rest)
     let slowRefresh   = takeFlag("--slow-refresh", from: &rest)
     let encrypted     = takeFlag("--encrypted",    from: &rest)
@@ -580,18 +580,4 @@ final class HLSFixtureServer: @unchecked Sendable {
     }
 }
 
-// MARK: - Arg helpers (scoped to this file)
 
-private func takeFlag(_ name: String, from rest: inout [String]) -> Bool {
-    guard let idx = rest.firstIndex(of: name) else { return false }
-    rest.remove(at: idx)
-    return true
-}
-
-private func takeIntArg(_ name: String, from rest: inout [String]) -> Int? {
-    guard let idx = rest.firstIndex(of: name),
-          idx + 1 < rest.count,
-          let v = Int(rest[idx + 1]) else { return nil }
-    rest.removeSubrange(idx...(idx + 1))
-    return v
-}

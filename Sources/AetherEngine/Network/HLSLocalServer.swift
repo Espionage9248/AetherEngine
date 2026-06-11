@@ -26,7 +26,8 @@ protocol HLSSegmentProvider: AnyObject {
     /// providers that hold segments only in memory or when the segment
     /// isn't yet available. Lets the server bypass Foundation's
     /// `Data(contentsOf:)` entirely and stream the file straight to
-    /// the socket via `sendfile(2)`.
+    /// the socket via a chunked read+send file stream (the original
+    /// `sendfile(2)` approach is SIGSYS-blocked by the tvOS sandbox).
     func mediaSegmentURL(at index: Int) -> URL?
 
     /// Number of segments currently known. May grow over time for
@@ -165,7 +166,7 @@ protocol HLSSegmentProvider: AnyObject {
 extension HLSSegmentProvider {
     /// Default: no file backing. Providers that store segments on
     /// disk override to return the file URL so the server can use
-    /// the `sendfile(2)` fast path.
+    /// the file-streaming fast path (no Data materialization).
     func mediaSegmentURL(at index: Int) -> URL? { nil }
 
     /// Default: append-only / VOD playlists always start at segment 0.
@@ -360,7 +361,7 @@ final class HLSLocalServer: @unchecked Sendable {
     }
 
     /// Lifetime sum of bytes ever sent through `writeAll` and
-    /// `sendfileAll` over all responses. Compared against the muxer's
+    /// `streamFileToSocket` over all responses. Compared against the muxer's
     /// `muxBytesMB` in the engine memprobe — equality confirms the
     /// data path is intact (no duplicate sends, no dropped bytes).
     private let byteCounterLock = NSLock()
@@ -383,7 +384,7 @@ final class HLSLocalServer: @unchecked Sendable {
         byteCounterLock.unlock()
     }
 
-    /// Lifetime count of segment bytes sent via the `sendfile(2)`
+    /// Lifetime count of segment bytes sent via the file-streaming
     /// fast path (file → socket entirely in-kernel, zero Swift Data
     /// involvement). Used to verify the path is actually taken vs.
     /// falling back to the Data path.
@@ -856,7 +857,7 @@ final class HLSLocalServer: @unchecked Sendable {
                         stateLock.unlock()
                     }
                     // Fast path: if the segment is file-backed (cache
-                    // adopt path), stream via `sendfile(2)` directly
+                    // adopt path), stream the file directly
                     // from the page cache to the socket — bypasses
                     // Foundation `Data(contentsOf:)` entirely. Tests
                     // the hypothesis that `.alwaysMapped` was silently
@@ -896,16 +897,26 @@ final class HLSLocalServer: @unchecked Sendable {
     /// straight at the mmap'd pages and hands it to `send(2)`.
     /// Kernel copies page-cache -> socket-send-buffer. No heap
     /// involvement.
+    /// Response-header construction shared by the 200/200-file/404
+    /// paths so the header shape can't drift between them.
+    private static func responseHeader(
+        status: String, contentLength: Int, contentType: String?
+    ) -> Data {
+        var header = "HTTP/1.1 \(status)\r\n"
+        if let contentType {
+            header += "Content-Type: \(contentType)\r\n"
+        }
+        header += "Content-Length: \(contentLength)\r\n"
+        if contentType != nil {
+            header += "Access-Control-Allow-Origin: *\r\n"
+            header += "Cache-Control: no-cache\r\n"
+        }
+        header += "Connection: keep-alive\r\n\r\n"
+        return Data(header.utf8)
+    }
+
     private func send200(fd: Int32, path: String, data: Data, contentType: String) -> Bool {
-        let header =
-            "HTTP/1.1 200 OK\r\n" +
-            "Content-Type: \(contentType)\r\n" +
-            "Content-Length: \(data.count)\r\n" +
-            "Access-Control-Allow-Origin: *\r\n" +
-            "Cache-Control: no-cache\r\n" +
-            "Connection: keep-alive\r\n" +
-            "\r\n"
-        let headerData = Data(header.utf8)
+        let headerData = Self.responseHeader(status: "200 OK", contentLength: data.count, contentType: contentType)
 
         EngineLog.emit("[HLSLocalServer] -> 200 \(path) bytes=\(data.count) type=\(contentType)",
                        category: .hlsServer)
@@ -917,7 +928,7 @@ final class HLSLocalServer: @unchecked Sendable {
     }
 
     /// HTTP 200 response whose body is streamed from a file via
-    /// `sendfile(2)`. Header goes through `writeAll` as usual; body
+    /// a chunked file stream. Header goes through `writeAll` as usual; body
     /// stays kernel-side. Returns false on file-open failure (treat
     /// as 5xx the caller logs and the connection dies), broken pipe,
     /// or zero-length file.
@@ -931,35 +942,23 @@ final class HLSLocalServer: @unchecked Sendable {
             return send404(fd: fd, path: path, reason: "file \(fileURL.lastPathComponent) missing or empty")
         }
 
-        let header =
-            "HTTP/1.1 200 OK\r\n" +
-            "Content-Type: \(contentType)\r\n" +
-            "Content-Length: \(fileSize)\r\n" +
-            "Access-Control-Allow-Origin: *\r\n" +
-            "Cache-Control: no-cache\r\n" +
-            "Connection: keep-alive\r\n" +
-            "\r\n"
-        let headerData = Data(header.utf8)
+        let headerData = Self.responseHeader(status: "200 OK", contentLength: fileSize, contentType: contentType)
 
-        EngineLog.emit("[HLSLocalServer] -> 200 \(path) bytes=\(fileSize) type=\(contentType) [sendfile]",
+        EngineLog.emit("[HLSLocalServer] -> 200 \(path) bytes=\(fileSize) type=\(contentType) [filestream]",
                        category: .hlsServer)
 
         guard writeAll(fd: fd, data: headerData, path: "\(path) [header]") else {
             return false
         }
-        return sendfileAll(fileURL: fileURL, socketFd: fd, path: path,
+        return streamFileToSocket(fileURL: fileURL, socketFd: fd, path: path,
                            expectedLength: fileSize)
     }
 
     private func send404(fd: Int32, path: String, reason: String) -> Bool {
-        let response =
-            "HTTP/1.1 404 Not Found\r\n" +
-            "Content-Length: 0\r\n" +
-            "Connection: keep-alive\r\n" +
-            "\r\n"
+        let response = Self.responseHeader(status: "404 Not Found", contentLength: 0, contentType: nil)
         EngineLog.emit("[HLSLocalServer] -> 404 \(path) reason=\(reason)",
                        category: .hlsServer)
-        return writeAll(fd: fd, data: Data(response.utf8), path: path)
+        return writeAll(fd: fd, data: response, path: path)
     }
 
     /// Blocking send loop. Reads `data` via `withUnsafeBytes` so
@@ -1021,7 +1020,7 @@ final class HLSLocalServer: @unchecked Sendable {
     /// are not sent; a short file fails the response (connection
     /// closes) instead of leaving the client waiting on a byte count
     /// that never completes.
-    private func sendfileAll(fileURL: URL, socketFd: Int32, path: String,
+    private func streamFileToSocket(fileURL: URL, socketFd: Int32, path: String,
                              expectedLength: Int) -> Bool {
         let handle: FileHandle
         do {

@@ -294,34 +294,7 @@ enum SubtitleDecoder {
     // MARK: - Rect → text
 
     private static func textForRect(_ rect: UnsafeMutablePointer<AVSubtitleRect>) -> String? {
-        if let textPtr = rect.pointee.text {
-            let s = String(cString: textPtr)
-            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty { return trimmed }
-        }
-        if let assPtr = rect.pointee.ass {
-            var line = String(cString: assPtr)
-            if line.hasPrefix("Dialogue: ") {
-                line.removeFirst("Dialogue: ".count)
-            }
-            let parts = line.split(separator: ",", maxSplits: 8, omittingEmptySubsequences: false)
-            let raw = parts.count == 9 ? String(parts[8]) : line
-            return cleanASSBody(raw)
-        }
-        return nil
+        SubtitleRectText.plainText(for: rect)
     }
 
-    private static func cleanASSBody(_ raw: String) -> String? {
-        var s = raw
-        s = s.replacingOccurrences(of: "\\N", with: "\n")
-        s = s.replacingOccurrences(of: "\\n", with: "\n")
-        s = s.replacingOccurrences(of: "\\h", with: " ")
-        s = s.replacingOccurrences(
-            of: "\\{[^}]*\\}",
-            with: "",
-            options: .regularExpression
-        )
-        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
 }

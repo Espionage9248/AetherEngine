@@ -166,38 +166,16 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         //    BiPlanarType8/10 hints. IOSurface-backed + Metal-compat
         //    so the layer can render via the GPU path.
         let bitsPerSample = codecpar.pointee.bits_per_raw_sample
-        let isHDRTransfer = codecpar.pointee.color_trc == AVCOL_TRC_SMPTE2084
-            || codecpar.pointee.color_trc == AVCOL_TRC_ARIB_STD_B67
+        let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
         let use10Bit = bitsPerSample > 8 || isHDRTransfer
         self.isHDR = isHDRTransfer
 
         // Capture color metadata from codecpar so every decoded
-        // pixel buffer gets the right attachments. Mapping matches
-        // SoftwareVideoDecoder.attachColorSpace.
-        self.colorPrimaries = {
-            switch codecpar.pointee.color_primaries {
-            case AVCOL_PRI_BT709:       return kCVImageBufferColorPrimaries_ITU_R_709_2
-            case AVCOL_PRI_BT2020:      return kCVImageBufferColorPrimaries_ITU_R_2020
-            case AVCOL_PRI_SMPTE432:    return kCVImageBufferColorPrimaries_P3_D65
-            default:                    return nil
-            }
-        }()
-        self.colorTransfer = {
-            switch codecpar.pointee.color_trc {
-            case AVCOL_TRC_BT709:        return kCVImageBufferTransferFunction_ITU_R_709_2
-            case AVCOL_TRC_SMPTE2084:    return kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
-            case AVCOL_TRC_ARIB_STD_B67: return kCVImageBufferTransferFunction_ITU_R_2100_HLG
-            default:                     return nil
-            }
-        }()
-        self.colorMatrix = {
-            switch codecpar.pointee.color_space {
-            case AVCOL_SPC_BT709:       return kCVImageBufferYCbCrMatrix_ITU_R_709_2
-            case AVCOL_SPC_BT2020_NCL, AVCOL_SPC_BT2020_CL:
-                                        return kCVImageBufferYCbCrMatrix_ITU_R_2020
-            default:                    return nil
-            }
-        }()
+        // pixel buffer gets the right attachments (shared mapping,
+        // see ColorAttachments).
+        self.colorPrimaries = ColorAttachments.primaries(codecpar.pointee.color_primaries)
+        self.colorTransfer = ColorAttachments.transfer(codecpar.pointee.color_trc)
+        self.colorMatrix = ColorAttachments.matrix(codecpar.pointee.color_space)
         let pixelFormat: OSType = use10Bit
             ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
             : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange

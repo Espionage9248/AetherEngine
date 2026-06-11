@@ -119,8 +119,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
         // Use 10-bit output for HDR content to preserve dynamic range.
         let bitsPerSample = codecpar.pointee.bits_per_raw_sample
-        let isHDRTransfer = codecpar.pointee.color_trc == AVCOL_TRC_SMPTE2084
-            || codecpar.pointee.color_trc == AVCOL_TRC_ARIB_STD_B67
+        let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
         use10Bit = bitsPerSample > 8 || isHDRTransfer
 
         // Release-visible: this is the only line that tells a
@@ -417,29 +416,9 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// This tells AVSampleBufferDisplayLayer the correct color space
     /// for rendering, critical for HDR10 (BT.2020 + PQ).
     private func attachColorSpace(from frame: UnsafeMutablePointer<AVFrame>, to pb: CVPixelBuffer) {
-        // Color primaries (e.g. BT.709, BT.2020)
-        let primaries: CFString? = switch frame.pointee.color_primaries {
-        case AVCOL_PRI_BT709:       kCVImageBufferColorPrimaries_ITU_R_709_2
-        case AVCOL_PRI_BT2020:      kCVImageBufferColorPrimaries_ITU_R_2020
-        case AVCOL_PRI_SMPTE432:    kCVImageBufferColorPrimaries_P3_D65
-        default:                    nil
-        }
-
-        // Transfer function (e.g. SDR gamma, PQ for HDR10, HLG)
-        let transfer: CFString? = switch frame.pointee.color_trc {
-        case AVCOL_TRC_BT709:       kCVImageBufferTransferFunction_ITU_R_709_2
-        case AVCOL_TRC_SMPTE2084:   kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
-        case AVCOL_TRC_ARIB_STD_B67: kCVImageBufferTransferFunction_ITU_R_2100_HLG
-        default:                    nil
-        }
-
-        // YCbCr matrix (e.g. BT.709, BT.2020)
-        let matrix: CFString? = switch frame.pointee.colorspace {
-        case AVCOL_SPC_BT709:       kCVImageBufferYCbCrMatrix_ITU_R_709_2
-        case AVCOL_SPC_BT2020_NCL, AVCOL_SPC_BT2020_CL:
-                                    kCVImageBufferYCbCrMatrix_ITU_R_2020
-        default:                    nil
-        }
+        let primaries = ColorAttachments.primaries(frame.pointee.color_primaries)
+        let transfer = ColorAttachments.transfer(frame.pointee.color_trc)
+        let matrix = ColorAttachments.matrix(frame.pointee.colorspace)
 
         if let primaries {
             CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, primaries, .shouldPropagate)

@@ -2503,8 +2503,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     }
 
     private func isHDRTransfer(_ codecpar: UnsafePointer<AVCodecParameters>) -> Bool {
-        let trc = codecpar.pointee.color_trc
-        return trc == AVCOL_TRC_SMPTE2084 || trc == AVCOL_TRC_ARIB_STD_B67
+        ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
     }
 
     /// When the source HEVC's `hvcC` (in `codecpar.extradata`) carries
