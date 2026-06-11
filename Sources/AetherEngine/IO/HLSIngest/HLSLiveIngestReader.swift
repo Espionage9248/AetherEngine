@@ -130,8 +130,16 @@ public final class HLSLiveIngestReader: IOReader, @unchecked Sendable {
                 if media.hasMap { throw HLSIngestError.unsupportedSegmentFormat }
                 refreshInterval = min(6, max(1, media.targetDuration / 2))
 
+                let isJoin = !sniffedFirstSegment
                 let fresh = tracker.newSegments(in: media)
                 if tracker.stallCount > 6 { throw HLSIngestError.ingestStalled }
+                if isJoin, !fresh.isEmpty {
+                    let backlog = fresh.reduce(0.0) { $0 + $1.duration }
+                    EngineLog.emit(
+                        "[HLSIngest] joined \(fresh.count) segment(s), ~\(Int(backlog))s behind the live edge",
+                        category: .engine
+                    )
+                }
 
                 for segment in fresh {
                     guard !Task.isCancelled else { return }
