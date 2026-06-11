@@ -525,6 +525,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         isLiveSession: Bool = false,
         dvrWindowSeconds: Double? = nil,
+        liveSourceCadenceHint: Double? = nil,
         preopenedDemuxer: Demuxer? = nil,
         sourceReopenableByURL: Bool = true
     ) {
@@ -540,6 +541,20 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.audioBridgeMode = audioBridgeMode
         self.isLiveSession = isLiveSession
         self.dvrWindowSeconds = dvrWindowSeconds
+        self.liveSourceCadenceHint = liveSourceCadenceHint
+        // A bursty source (upstream segments materially longer than our cut
+        // target) cannot honor the LL-HLS blocking-reload contract: held
+        // reloads would resolve only when the next upstream batch lands,
+        // which AVPlayer flags as invalid blocking behavior (-15410) and
+        // punishes with start delays and periodic stalls (device repro
+        // 2026-06-11). For those sources, advertise NO blocking reload and
+        // raise TARGETDURATION to the real arrival cadence so the plain
+        // reload patience (1.5x TD) covers the inter-batch gap. Computed
+        // once here; nil hint (URL live sources, VOD) keeps the previous
+        // behavior exactly: blocking reload on, no extra TD floor.
+        self.liveBlockingReloadEnabled = liveSourceCadenceHint
+            .map { $0 <= Self.targetSegmentDuration * 1.5 } ?? true
+        self.liveTargetDurationFloorSeconds = liveSourceCadenceHint.map { ceil($0) }
         self.preopenedDemuxer = preopenedDemuxer
         self.sourceReopenableByURL = sourceReopenableByURL
     }
@@ -563,6 +578,22 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// `handlePumpFinished` surfaces the loss to the host via
     /// `onLiveSourceReset` immediately instead.
     private let sourceReopenableByURL: Bool
+
+    /// Upstream segment cadence in seconds for a custom-ingest live
+    /// session (the upstream playlist's EXT-X-TARGETDURATION, via
+    /// `LiveIngestSourceInfo`). nil for URL live sources and VOD.
+    private let liveSourceCadenceHint: Double?
+
+    /// Whether the local live playlist may advertise LL-HLS blocking
+    /// reload (CAN-BLOCK-RELOAD). Derived once in init from
+    /// `liveSourceCadenceHint`; see the init comment for the rationale.
+    private let liveBlockingReloadEnabled: Bool
+
+    /// Extra floor (seconds) for the local live playlist's
+    /// #EXT-X-TARGETDURATION: ceil(upstream cadence), so AVPlayer's
+    /// unchanged-playlist patience (1.5x TD) covers the real inter-batch
+    /// arrival gap of a bursty ingest source. nil when no cadence hint.
+    private let liveTargetDurationFloorSeconds: Double?
 
     /// DVR window in seconds for a live session (from `LoadOptions`).
     /// `nil` means live-only: no DVR seek, but the live window is still
@@ -1171,6 +1202,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 targetSegmentDurationSeconds: Self.targetSegmentDuration,
                 dvrWindowSeconds: dvrWindowSeconds
             ),
+            blockingReloadEnabled: liveBlockingReloadEnabled,
+            targetDurationFloorSeconds: liveTargetDurationFloorSeconds,
             restartHandler: isLiveSession ? nil : { [weak self] idx in
                 self?.restartProducer(at: idx)
             }
@@ -3089,6 +3122,17 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     /// cache eviction cutoff, so the two never drift. Dormant for VOD.
     private let liveWindowSizing: LiveWindowSizing
 
+    /// Whether the live playlist may advertise LL-HLS blocking reload.
+    /// Derived by HLSVideoEngine from the ingest source's cadence hint
+    /// (false for bursty upstreams that cannot honor the blocking-reload
+    /// contract); true for URL live sources and VOD (where it is unused).
+    private let blockingReloadEnabled: Bool
+
+    /// Extra #EXT-X-TARGETDURATION floor (seconds) for bursty ingest
+    /// sources, derived by HLSVideoEngine (ceil of the upstream cadence).
+    /// nil for URL live sources and VOD.
+    private let targetDurationFloorSeconds: Double?
+
     private let codecsString: String
     private let supplementalCodecsString: String?
     private let resolution: (Int, Int)
@@ -3220,12 +3264,16 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
         initialIndex: Int = 0,
         isLive: Bool = false,
         liveWindowSizing: LiveWindowSizing = LiveWindowSizing(targetSegmentDurationSeconds: 4.0, dvrWindowSeconds: nil),
+        blockingReloadEnabled: Bool = true,
+        targetDurationFloorSeconds: Double? = nil,
         restartHandler: ((Int) -> Void)? = nil
     ) {
         self.cache = cache
         self.segments = segments
         self.isLive = isLive
         self.liveWindowSizing = liveWindowSizing
+        self.blockingReloadEnabled = blockingReloadEnabled
+        self.targetDurationFloorSeconds = targetDurationFloorSeconds
         self.codecsString = codecsString
         self.supplementalCodecsString = supplementalCodecs
         self.resolution = resolution
@@ -3756,6 +3804,16 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     /// sources. Returns nil for VOD (the default extension nil suffices).
     var liveTargetSegmentDuration: Double? {
         isLive ? liveWindowSizing.targetSegmentDurationSeconds : nil
+    }
+    /// Blocking-reload eligibility, decided by HLSVideoEngine from the
+    /// ingest source's cadence (see the engine init comment). The playlist
+    /// builder gates #EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES on this,
+    /// and the server's media.m3u8 handler skips the blocking hold when
+    /// false. Only meaningful for live; harmless true otherwise.
+    var liveBlockingReloadEnabled: Bool { blockingReloadEnabled }
+    /// Extra TARGETDURATION floor for bursty ingest sources, nil otherwise.
+    var liveTargetDurationFloorSeconds: Double? {
+        isLive ? targetDurationFloorSeconds : nil
     }
     /// Live startup buffer, in segments. The manifest handler holds the FIRST
     /// playlist response until this many segments exist, so AVPlayer (which

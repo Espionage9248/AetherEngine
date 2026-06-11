@@ -1729,6 +1729,15 @@ public final class AetherEngine: ObservableObject {
         preopenedDemuxer: Demuxer? = nil,
         generation: UInt64
     ) async throws {
+        // Upstream cadence hint for ingest sessions (nil for URL sources).
+        // Safe to read here: the load probe's demuxer open blocked on the
+        // reader's first bytes, and HLSLiveIngestReader publishes its
+        // upstreamTargetDuration before any segment byte enters the FIFO
+        // (see the ordering guarantee on that property), so by the time
+        // loadNative runs the value is set for any reader that knows it.
+        // HLSVideoEngine derives the playlist shaping (blocking-reload
+        // eligibility, TARGETDURATION floor) from the hint itself.
+        let liveSourceCadenceHint = (customReader as? LiveIngestSourceInfo)?.upstreamTargetDuration
         let session = HLSVideoEngine(
             url: url,
             sourceHTTPHeaders: sourceHTTPHeaders,
@@ -1742,6 +1751,7 @@ public final class AetherEngine: ObservableObject {
             audioBridgeMode: audioBridgeMode,
             isLiveSession: isLive,
             dvrWindowSeconds: dvrWindowSeconds,
+            liveSourceCadenceHint: liveSourceCadenceHint,
             preopenedDemuxer: preopenedDemuxer,
             sourceReopenableByURL: !isCustomSource
         )

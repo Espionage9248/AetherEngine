@@ -20,7 +20,7 @@ import Foundation
 /// Memory: the FIFO caps at 16 MB plus at most one segment of overshoot;
 /// extreme-bitrate sources transiently hold one fetched segment on top.
 /// Switching to streamed segment reads is a P2 option if that ever bites.
-public final class HLSLiveIngestReader: IOReader, @unchecked Sendable {
+public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @unchecked Sendable {
     private let playlistURL: URL
     private let fifo = ByteFIFO(capacity: 16 * 1024 * 1024)
     private let session: URLSession
@@ -33,9 +33,27 @@ public final class HLSLiveIngestReader: IOReader, @unchecked Sendable {
     /// startLock, read by the host after the FIFO signals failure.
     private var _terminalError: HLSIngestError?
 
+    /// Upstream media playlist's EXT-X-TARGETDURATION (seconds), set by
+    /// the ingest loop the moment the first media playlist is parsed.
+    /// Protected by startLock; first write wins (the upstream cadence is
+    /// effectively constant for a session).
+    private var _upstreamTargetDuration: Double?
+
     /// Terminal ingest error, readable by the host for fallback logging.
     public var terminalError: HLSIngestError? {
         startLock.withLock { _terminalError }
+    }
+
+    /// `LiveIngestSourceInfo`: the upstream playlist's EXT-X-TARGETDURATION
+    /// in seconds, nil until the ingest loop has parsed a media playlist.
+    /// Ordering guarantee for consumers: the ingest loop writes this BEFORE
+    /// it fetches (let alone FIFO-publishes) any segment bytes, and the
+    /// loop only starts via `startIfNeeded()` on the first `read()`. So any
+    /// consumer that has already received stream bytes (e.g. the engine
+    /// after its blocking load probe) is guaranteed to observe a non-nil
+    /// value here.
+    public var upstreamTargetDuration: Double? {
+        startLock.withLock { _upstreamTargetDuration }
     }
 
     public init(playlistURL: URL) {
@@ -125,6 +143,16 @@ public final class HLSLiveIngestReader: IOReader, @unchecked Sendable {
                         throw HLSIngestError.playlistInvalid(reason: "expected media playlist on refresh")
                     }
                     media = fetched
+                }
+                // Publish the upstream cadence before ANY segment byte can
+                // reach the FIFO (see `upstreamTargetDuration` ordering
+                // guarantee). Covers both the seed path (playlist parsed in
+                // resolveMediaPlaylistURL) and every refresh; first write
+                // wins.
+                startLock.withLock {
+                    if _upstreamTargetDuration == nil {
+                        _upstreamTargetDuration = media.targetDuration
+                    }
                 }
                 if media.isEncrypted { throw HLSIngestError.encryptedNotSupported }
                 if media.hasMap { throw HLSIngestError.unsupportedSegmentFormat }

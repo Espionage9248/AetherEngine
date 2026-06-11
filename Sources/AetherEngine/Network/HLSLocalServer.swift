@@ -61,6 +61,22 @@ protocol HLSSegmentProvider: AnyObject {
     /// the existing `ceil(maxProducedDuration)` computation unchanged.
     var liveTargetSegmentDuration: Double? { get }
 
+    /// Whether the live playlist may advertise LL-HLS blocking reload
+    /// (#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES). A bursty ingest
+    /// source (upstream segments materially longer than the local cut
+    /// target) cannot honor the blocking-reload contract, held reloads
+    /// would resolve only when the next upstream batch lands, which
+    /// AVPlayer flags as invalid blocking behavior (-15410). Default true
+    /// (URL live sources, VOD/EVENT where it is never consulted).
+    var liveBlockingReloadEnabled: Bool { get }
+
+    /// Optional extra floor (seconds) for the live playlist's
+    /// #EXT-X-TARGETDURATION: the real upstream arrival cadence of a
+    /// bursty ingest source, so AVPlayer's unchanged-playlist patience
+    /// (1.5x TARGETDURATION) covers the inter-batch gap. nil keeps the
+    /// existing computation unchanged.
+    var liveTargetDurationFloorSeconds: Double? { get }
+
     /// Optional master-playlist metadata. When `masterCodecs` is
     /// non-nil, the server publishes a `master.m3u8` containing one
     /// variant referencing `media.m3u8` plus these attributes; when
@@ -166,6 +182,13 @@ extension HLSSegmentProvider {
     /// Default: not a live provider; playlist builder uses the
     /// computed-from-segments path.
     var liveTargetSegmentDuration: Double? { nil }
+
+    /// Default: blocking reload allowed (URL live sources and every
+    /// non-live provider, where the flag is never consulted).
+    var liveBlockingReloadEnabled: Bool { true }
+
+    /// Default: no extra TARGETDURATION floor.
+    var liveTargetDurationFloorSeconds: Double? { nil }
 
     /// Blocks the calling thread until this provider has at least one
     /// segment ready, or until `timeout` seconds elapse, whichever
@@ -767,7 +790,15 @@ final class HLSLocalServer: @unchecked Sendable {
                     // timeout is a safety net (3 x target duration); on
                     // timeout we serve the current playlist and AVPlayer
                     // reissues the blocking reload.
-                    _ = p.waitForLiveSegment(index: msn, timeout: 18.0)
+                    //
+                    // Only when the provider advertises blocking reload:
+                    // when CAN-BLOCK-RELOAD is withheld (bursty ingest
+                    // sources, see buildMediaPlaylistText) a client that
+                    // still sends the directive gets the current playlist
+                    // immediately, never a hold it did not opt into.
+                    if p.liveBlockingReloadEnabled {
+                        _ = p.waitForLiveSegment(index: msn, timeout: 18.0)
+                    }
                 } else {
                     // First (non-directive) load: hold until the startup
                     // cushion exists so AVPlayer never sees an empty live
@@ -1171,6 +1202,18 @@ final class HLSLocalServer: @unchecked Sendable {
             targetDuration = max(targetDuration, liveFloor)
         }
 
+        // Bursty ingest sources: raise TARGETDURATION to the real upstream
+        // arrival cadence (ceil of the source playlist's TARGETDURATION).
+        // Segments materially longer than the cut target arrive in batches,
+        // so the playlist advances only once per upstream segment; without
+        // this floor AVPlayer's unchanged-playlist patience (1.5x TD) is
+        // shorter than the genuine inter-batch gap and trips -12888 /
+        // periodic stalls. Pairs with liveBlockingReloadEnabled == false
+        // below. nil (URL live sources) keeps the computation unchanged.
+        if typeIsLive, let cadenceFloor = provider.liveTargetDurationFloorSeconds {
+            targetDuration = max(targetDuration, Int(ceil(cadenceFloor)))
+        }
+
         var lines: [String] = []
         lines.append("#EXTM3U")
         lines.append("#EXT-X-VERSION:7")
@@ -1188,7 +1231,19 @@ final class HLSLocalServer: @unchecked Sendable {
             // partial segments), so AVPlayer sends `_HLS_msn` without
             // `_HLS_part`. No explicit HOLD-BACK: AVPlayer uses its default
             // (3 x TARGETDURATION) distance from the live edge.
-            lines.append("#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES")
+            //
+            // Gated on the provider: a bursty source (upstream segments
+            // materially longer than our cut target) cannot honor the
+            // blocking-reload contract; held reloads would resolve only
+            // when the next upstream batch lands, which AVPlayer flags as
+            // invalid blocking behavior (CoreMediaErrorDomain -15410) and
+            // punishes with start delays and periodic stalls (device repro
+            // 2026-06-11). Those sources fall back to plain reloads, with
+            // TARGETDURATION raised to the real arrival cadence above so
+            // the reload patience covers the inter-batch gap.
+            if provider.liveBlockingReloadEnabled {
+                lines.append("#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES")
+            }
         }
         lines.append("#EXT-X-TARGETDURATION:\(targetDuration)")
         lines.append("#EXT-X-MEDIA-SEQUENCE:\(firstVisible)")

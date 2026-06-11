@@ -14,43 +14,56 @@ final class HLSPlaylistTrackerTests: XCTestCase {
         )
     }
 
-    func testPrimesAtLiveEdgeWithDurationCap() {
-        // 4s segments, 8s cap: two segments fit, the third would exceed.
-        var tracker = HLSPlaylistTracker(edgeOffset: 3, maxJoinSeconds: 8)
+    func testPrimesAtLiveEdgeWithCoverageTarget() {
+        // 4s segments: coverage = max(8, 1.5 * 4) = 8s. The second segment
+        // reaches it, so the join takes exactly two (previous behaviour).
+        var tracker = HLSPlaylistTracker(edgeOffset: 3, minJoinCoverageSeconds: 8)
         let new = tracker.newSegments(in: playlist(sequence: 100, uris: ["a", "b", "c", "d", "e", "f"]))
         XCTAssertEqual(new.map(\.uri), ["e", "f"])
         XCTAssertEqual(tracker.stallCount, 0)
     }
 
-    func testPrimeRespectsSegmentCountCapWhenDurationAllowsMore() {
-        // Tiny 1s segments: the duration cap would allow 8, edgeOffset caps at 3.
-        var tracker = HLSPlaylistTracker(edgeOffset: 3, maxJoinSeconds: 8)
+    func testPrimeRespectsSegmentCountCapWhenCoverageWantsMore() {
+        // Tiny 1s segments: the 8s coverage target would want 8 segments,
+        // edgeOffset caps at 3.
+        var tracker = HLSPlaylistTracker(edgeOffset: 3, minJoinCoverageSeconds: 8)
         let new = tracker.newSegments(in: playlist(sequence: 0, uris: ["a", "b", "c", "d", "e", "f"], duration: 1))
         XCTAssertEqual(new.map(\.uri), ["d", "e", "f"])
     }
 
-    func testPrimeTakesSingleLongSegment() {
-        // 12s segments exceed the cap on their own: still take exactly one.
-        var tracker = HLSPlaylistTracker(edgeOffset: 3, maxJoinSeconds: 8)
+    func testPrimeCoversUpstreamCadenceForLongSegments() {
+        // 12s segments: coverage = max(8, 1.5 * 12) = 18s. One segment
+        // (12s) is below it, two (24s) reach it: take exactly two, so the
+        // buffer rides out a full upstream inter-batch gap.
+        var tracker = HLSPlaylistTracker(edgeOffset: 3, minJoinCoverageSeconds: 8)
         let new = tracker.newSegments(in: playlist(sequence: 50, uris: ["a", "b", "c"], duration: 12))
-        XCTAssertEqual(new.map(\.uri), ["c"])
+        XCTAssertEqual(new.map(\.uri), ["b", "c"])
+    }
+
+    func testPrimeCoversBurstyTenSecondUpstream() {
+        // The device-repro shape: 10s upstream segments. Coverage =
+        // max(8, 1.5 * 10) = 15s -> two segments / 20s, one full upstream
+        // cadence of buffer across the burst gap.
+        var tracker = HLSPlaylistTracker(edgeOffset: 3, minJoinCoverageSeconds: 8)
+        let new = tracker.newSegments(in: playlist(sequence: 7, uris: ["a", "b", "c", "d"], duration: 10))
+        XCTAssertEqual(new.map(\.uri), ["c", "d"])
     }
 
     func testPrimesAtWindowStartWhenWindowIsShort() {
-        var tracker = HLSPlaylistTracker(edgeOffset: 3, maxJoinSeconds: 8)
+        var tracker = HLSPlaylistTracker(edgeOffset: 3, minJoinCoverageSeconds: 8)
         let new = tracker.newSegments(in: playlist(sequence: 100, uris: ["a", "b"]))
         XCTAssertEqual(new.map(\.uri), ["a", "b"])
     }
 
     func testReturnsOnlyNewSegmentsOnRefresh() {
-        var tracker = HLSPlaylistTracker(edgeOffset: 3, maxJoinSeconds: 8)
+        var tracker = HLSPlaylistTracker(edgeOffset: 3, minJoinCoverageSeconds: 8)
         _ = tracker.newSegments(in: playlist(sequence: 100, uris: ["a", "b", "c"]))
         let new = tracker.newSegments(in: playlist(sequence: 101, uris: ["b", "c", "d"]))
         XCTAssertEqual(new.map(\.uri), ["d"])
     }
 
     func testCountsStallsAndResets() {
-        var tracker = HLSPlaylistTracker(edgeOffset: 3, maxJoinSeconds: 8)
+        var tracker = HLSPlaylistTracker(edgeOffset: 3, minJoinCoverageSeconds: 8)
         _ = tracker.newSegments(in: playlist(sequence: 100, uris: ["a", "b", "c"]))
         _ = tracker.newSegments(in: playlist(sequence: 100, uris: ["a", "b", "c"]))
         XCTAssertEqual(tracker.stallCount, 1)
@@ -61,7 +74,7 @@ final class HLSPlaylistTrackerTests: XCTestCase {
     }
 
     func testWindowSlidePastCursorRejoinsAtEdgeWithDiscontinuity() {
-        var tracker = HLSPlaylistTracker(edgeOffset: 3, maxJoinSeconds: 8)
+        var tracker = HLSPlaylistTracker(edgeOffset: 3, minJoinCoverageSeconds: 8)
         _ = tracker.newSegments(in: playlist(sequence: 100, uris: ["a", "b", "c"]))
         // Provider window slid far past our cursor: rejoin at the edge
         // (duration-capped to two 4s segments).
