@@ -50,7 +50,7 @@ You provide the transport bar. You provide the dropdowns. You provide the pretty
 | Frames      | Still-image extraction off-playback via `FrameExtractor`: `thumbnail` (nearest keyframe, downscaled, fast, for scrub previews / Recents) and `snapshot` (frame-accurate, full resolution, for user stills), both as `CGImage`. Isolated FFmpeg decode context, bounded LRU cache, idle-close lifecycle |
 | Metadata    | `MediaMetadata` parsed from the container on `load`: normalised title / artist / album / albumArtist tags plus embedded cover art. Published on the engine and carried in `SourceProbe`, so a host gets track info without its own tag parser. `aetherctl probe` prints it |
 | Seek        | Producer teardown + restart for backward / far-forward scrubs; short-range forward scrubs ride the cached segment window    |
-| Streaming   | Playback reads the source over one long-lived forward-streaming `URLSession` connection (VLC-style): bytes stream into a sliding window, a new request is issued only on a seek outside that window. Still extraction uses discrete Range chunks for random access; live transcode uses a single sequential GET |
+| Streaming   | Playback reads the source over one long-lived forward-streaming `URLSession` connection (VLC-style): bytes stream into a sliding window, a new request is issued only on a seek outside that window. Still extraction uses discrete Range chunks for random access; live sources ride the same persistent connection (reconnect-capable even without a Content-Length); only non-live sources without a known length fall back to a single sequential GET |
 | Live / DVR  | Unbounded live playback with optional in-session timeshift (DVR). `LoadOptions.isLive` opts the session in; `dvrWindowSeconds` (e.g. `1800`) enables rewind. Native path (H.264 / HEVC / AV1-with-HW): a forward-only live producer cuts segments into a sliding HLS playlist served to AVPlayer; timeshift uses AVPlayer's native seekable range. Software path (AV1-without-HW / VP9 / MPEG-2 / VC-1): unbounded live with a disk-spooled `PacketRingBuffer` for rewind. Both paths share a session-relative timeline (seconds since first frame) so a host draws one scrubber regardless of backend. Engine publishes `liveEdgeTime`, `seekableLiveRange`, `isAtLiveEdge`, and `behindLiveSeconds`; `seekToLiveEdge()` snaps to the edge. The live playlist advertises LL-HLS blocking reload (`CAN-BLOCK-RELOAD`) so AVPlayer receives each segment the instant it is cut; broadcast program boundaries (PTS resets, PCR wraps) are rebased onto a continuous output timeline with `#EXT-X-DISCONTINUITY` / `#EXT-X-DISCONTINUITY-SEQUENCE` bookkeeping and A/V-paired shifts; a lost live source (dead tuner, killed transcode) auto-reopens with capped backoff and resumes on the same timeline. Live HLS upstreams can be ingested directly via `HLSLiveIngestReader` (public forward-only `IOReader`): master-playlist variant selection (highest bandwidth), duration-capped live-edge join, sequential segment fetch flattened into one TS stream, and typed `HLSIngestError`s (encrypted / fMP4 / unreachable / stalled) so hosts can fall back to a server-mediated path; the local playlist adapts `TARGETDURATION` and LL-HLS blocking-reload eligibility to the upstream's real segment cadence, and a terminal ingest loss fires the host retune surface instead of a doomed URL reopen |
 | Resilience  | Direct-URL playback survives CDN stutters: a dropped connection, socket stall, or early close reconnects at the last byte delivered instead of ending playback (only the real end of file reports EOF). `429` / `503` honour `Retry-After`, expired signed URLs re-resolve against the source, and a progress-aware cap stops a dead or flapping origin from hammering the CDN. Plus background pause and a display-link aware lifecycle |
 | Custom input | Play from any byte source via the `IOReader` protocol, passed as `MediaSource.custom` to `load(source:)`: memory buffers, encrypted-at-rest archives, proprietary containers. Seekable readers work on both the native and software playback paths (forward-only readers: software path for VOD, native loopback for live sessions), with audio-track switching, background reload, embedded subtitles, and scrub preview for readers that vend a second cursor |
@@ -244,7 +244,7 @@ Format coverage follows the engine's native-first / software-fallback split. H.2
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "3.3.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "3.3.1")
 ```
 
 Two complementary samples ship in `Examples/`:
@@ -431,7 +431,7 @@ Subtitle packets are routed through the same demux loop as audio and video. No s
 - **Bitmap codecs** (PGS / HDMV PGS / DVB / DVD) → `.image(SubtitleImage)`. The indexed pixel plane is walked through its palette, premultiplied against alpha, and wrapped as a `CGImage`. Position is normalised in `[0..1]` against the source video frame so the host scales to any on-screen rect.
 - **Sidecar files** (a separate `.srt` / `.ass` / `.vtt` URL) → `selectSidecarSubtitle(url:httpHeaders:)` opens its own short-lived `AVFormatContext`, decodes the whole file once, atomically swaps the result into `subtitleCues`. The fetch forwards the session's `LoadOptions.httpHeaders` by default (WebDAV auth and friends); pass the call's own `httpHeaders` to override per fetch.
 
-A single packet that carries multiple rects (PGS often emits signs/songs at the top alongside dialogue at the bottom) becomes multiple cues at the same time range, and the host renders all of them. Cues are inserted in sorted order; backward seeks dedupe by `start|end` so the list doesn't grow on rewind.
+A single packet that carries multiple rects (PGS often emits signs/songs at the top alongside dialogue at the bottom) becomes multiple cues at the same time range, and the host renders all of them. Cues are inserted in sorted order; re-emitted events after a seek dedupe by time range plus content (so two simultaneous speaker lines with identical timing both survive) and the list doesn't grow on rewind.
 
 Hosts that render authored ASS styling themselves (positioning, speaker colours, karaoke) opt out of the stripping with `LoadOptions(preserveASSMarkup: true)`: cues then carry the raw event line (override tags, style references, escapes intact), `TrackInfo.assHeader` carries the track's script header (`[Script Info]` + `[V4+ Styles]`), and `engine.fontAttachments` carries the container's embedded fonts (TTF / OTF) for the renderer's font directory. `ASSScriptBuilder` reassembles raw event cues + header into a complete script for whole-file renderers such as swift-ass-renderer's `loadTrack(content:)`, hardened against real-world Matroska tracks (synthesized `[Events]` section, NUL stripping, content-keyed dedupe since real files hardcode `ReadOrder: 0`).
 
@@ -465,9 +465,16 @@ HDR sources come out looking right: PQ / HLG BT.2020 frames are tone-mapped to S
 
 ```
 Sources/AetherEngine/
-├── AetherEngine.swift                       Public API + codec dispatch + subtitle stream decode
+├── AetherEngine.swift                       Engine core: stored state, load dispatch, transport, stop/seek, track selection
+├── AetherEngine+Probe.swift                 Static probe machinery: probe(url:/source:), swDecodeProbe, format / frame-rate / codec-label detection
+├── AetherEngine+Loading.swift               The five per-backend loaders (remote-HLS, native, software, audio, audio-native) + reload
+├── AetherEngine+Subtitles.swift             Embedded + sidecar subtitle pipeline (side demuxer task, cue apply / prune)
+├── AetherEngine+Live.swift                  Live window publishing, edge snap, resume clamp, scrub thumbnails
+├── AetherEngine+Diagnostics.swift           Memory probe + live-telemetry bridge
 ├── PlaybackClock.swift                      engine.clock: the ~10 Hz ticking values (currentTime, sourceTime, progress, live-edge fields) as a separate ObservableObject
 ├── PlayerState.swift                        PlaybackState, VideoFormat, PlaybackBackend, LoadOptions, SourceProbe, TrackInfo, FontAttachment, MediaMetadata, SubtitleCue, SubtitleImage
+├── TransportControllable.swift              Common transport surface of the four playback hosts (single active-host dispatch)
+├── FFmpegErrorConstants.swift               AVERROR sentinels Swift can't import from the C macros
 ├── Audio/
 │   ├── AudioAVPlayerHost.swift              Audio-only path: bare AVPlayer host for whitelisted codecs, owns the persistent per-player MPNowPlayingSession (tvOS / iOS)
 │   ├── AudioBridge.swift                    Native path: decode + re-encode per `AudioBridgeMode` (EAC3 5.1 default or lossless FLAC opt-in) for source codecs that can't stream-copy into fMP4
@@ -483,7 +490,7 @@ Sources/AetherEngine/
 │   └── VideoDecoderTypes.swift              DecodedFrameHandler typealias + VideoDecoderError
 ├── Demuxer/
 │   ├── AVIOProvider.swift                   Internal seam over a custom-AVIO byte source; AVIOReader and CustomIOReaderBridge both plug into the Demuxer through it
-│   ├── AVIOReader.swift                     URLSession-backed avio_alloc_context, three modes: persistent forward-streaming connection with reconnect-on-drop (playback), discrete Range chunks (still extraction), single sequential GET (live)
+│   ├── AVIOReader.swift                     URLSession-backed avio_alloc_context, three modes: persistent forward-streaming connection with reconnect-on-drop (playback, incl. live), discrete Range chunks (still extraction), single sequential GET with backpressure (non-live sources without Content-Length)
 │   ├── CustomIOReaderBridge.swift           Bridges a host-supplied IOReader into avio_alloc_context read / seek callbacks
 │   └── Demuxer.swift                        libavformat wrapper
 ├── Diagnostics/
@@ -491,6 +498,7 @@ Sources/AetherEngine/
 │   ├── EngineLog.swift                      Gated OSLog emission
 │   ├── FFmpegLogBridge.swift                av_log_set_callback funnel: FFmpeg's internal warnings surface through EngineLog
 │   ├── LiveTelemetry.swift                  Value type emitted at 1 Hz: instant / avg bitrate, buffer, network, dropped frames, observed FPS, A/V sync gap, plus subsystem byte counters
+│   ├── FourCC.swift                         Printable FourCC rendering for codec-tag diagnostics
 │   ├── LiveTelemetrySampler.swift           @MainActor 1 Hz sampler that reads existing subsystem counters and assembles LiveTelemetry snapshots
 │   └── PacketBalanceTracker.swift           Process-wide AVPacket alloc/free balance counter for leak diagnostics
 ├── Display/
@@ -521,9 +529,15 @@ Sources/AetherEngine/
 ├── Renderer/
 │   └── SampleBufferRenderer.swift           SW path: AVSampleBufferDisplayLayer + B-frame reorder, HDR10+ attachments
 ├── Subtitles/
-│   └── ASSScriptBuilder.swift               Reassembles raw ASS event cues + TrackInfo.assHeader into a complete script for whole-file renderers
+│   ├── ASSScriptBuilder.swift               Reassembles raw ASS event cues + TrackInfo.assHeader into a complete script for whole-file renderers
+│   └── SubtitleRectText.swift               Plain-text extraction from subtitle rects (ASS dialogue parsing), shared by the inline and sidecar decoders
 ├── Video/
-│   ├── HLSVideoEngine.swift                 Native path: session orchestrator (muxer wiring, audio cascade, DV signaling, scrub teardown)
+│   ├── HLSVideoEngine.swift                 Native path: session orchestrator (start/stop, producer construction + restart, shift handling)
+│   ├── HLSVideoEngine+AudioRoute.swift      Native path: stream-copy -> FLAC-bridge -> video-only audio cascade
+│   ├── HLSVideoEngine+SegmentPlanning.swift Native path: keyframe / uniform segment plans, extradata + AAC fixups
+│   ├── HLSVideoEngine+LiveReopen.swift      Native path: live source-loss recovery (capped-backoff reopen on the same timeline)
+│   ├── CodecRoutePolicy.swift               Native path: DV / HDR / codec routing decisions (track types, CODECS strings, VIDEO-RANGE)
+│   ├── VideoSegmentProvider.swift           Native path: playlist-facing segment provider (live sliding window, restart heuristics)
 │   ├── HLSSegmentProducer.swift             Native path: pump loop reading from Demuxer, feeding MP4SegmentMuxer, cutting fragments at segment-plan boundaries
 │   ├── LiveWindow.swift                     Live path: session-relative DVR timeline (seconds since first frame), shared by the native and SW live paths
 │   ├── MP4SegmentMuxer.swift                Native path: session-long fragmented-MP4 muxer (+empty_moov+default_base_moof+frag_custom+delay_moov)
@@ -557,7 +571,7 @@ swift run aetherctl serve <url>          # park the engine's loopback HLS-fMP4 s
 swift run aetherctl validate <url>       # serve + run mediastreamvalidator, exit
 swift run aetherctl swdecode <url>       # open SoftwareVideoDecoder, decode N packets, report
 swift run aetherctl extract <url>        # FrameExtractor still-image extraction + leak testing
-swift run aetherctl audio <url>          # audio-only pipeline smoke test (plays N seconds)
+swift run aetherctl audio [--seconds N] <url>   # audio-only pipeline smoke test (default 10 s)
 swift run aetherctl customio <path>      # exercise the custom IOReader path end-to-end
 swift run aetherctl live                 # live MPEG-TS session against the built-in fixture
 swift run aetherctl dvr                  # DVR rewind matrix across native + SW paths
@@ -622,9 +636,10 @@ swift run aetherctl extract --width 480 <url>                  # keyframe thumbn
 leaks --atExit -- .build/debug/aetherctl extract --loops 8 <url>   # leak sweep
 ```
 
-`audio` plays a source through the audio-only pipeline for ten seconds
-and reports which host took it (bare AVPlayer vs the FFmpeg renderer
-path), exercising the same dispatch a music host sees.
+`audio` plays a source through the audio-only pipeline (default ten
+seconds, `--seconds N` to override) and reports which host took it
+(bare AVPlayer vs the FFmpeg renderer path), exercising the same
+dispatch a music host sees.
 
 `customio` wraps a local file in a custom `IOReader` and plays it
 through `load(source:)`. `--memory` reads via `DataIOReader`,
@@ -688,13 +703,13 @@ AetherEngine uses [Semantic Versioning](https://semver.org). The public API surf
 
 `internal` types and properties are not part of the contract and may change in any release. `@testable import AetherEngine` reaches them for the package's own tests, not for production use.
 
-Pin `from: "3.3.0"` in your `Package.swift` to allow patch + minor updates while excluding breaking changes:
+Pin `from: "3.3.1"` in your `Package.swift` to allow patch + minor updates while excluding breaking changes:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "3.3.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "3.3.1")
 ```
 
-Pin to `.upToNextMinor(from: "3.3.0")` for stricter teams that prefer to opt into minor bumps explicitly. See [CHANGELOG.md](CHANGELOG.md) for the per-release index.
+Pin to `.upToNextMinor(from: "3.3.1")` for stricter teams that prefer to opt into minor bumps explicitly. See [CHANGELOG.md](CHANGELOG.md) for the per-release index.
 
 ## Requirements
 
