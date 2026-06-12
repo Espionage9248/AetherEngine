@@ -81,7 +81,7 @@ func printUsage() {
       aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio [--seconds N] <url>
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] <file>
-      aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--gen-highbitrate-seed]
+      aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--reload-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--gen-highbitrate-seed]
       aetherctl dvr [--path native|sw|both] [--seconds N] [--dvr-window N]
       aetherctl hlsfixture <input.ts> [--port N] [--segment-seconds N]
                            [--master] [--discontinuity-at N] [--slow-refresh]
@@ -232,6 +232,11 @@ if first == "live" {
     let measureRSS = takeFlag("--measure-rss", from: &rest)
     let reportCacheBytes = takeFlag("--report-cache-bytes", from: &rest)
     let rewindTest = takeFlag("--rewind-test", from: &rest)
+    // --reload-test: warm up a live session, then exercise the live
+    // REJOIN path (reloadAtCurrentPosition) and verdict on whether the
+    // rejoined clock advances. Manual macOS repro for the tvOS
+    // live-reload frozen-frame stall; see liveReloadTest in LiveCmd.
+    let reloadTest = takeFlag("--reload-test", from: &rest)
     // --sw forces the live source through SoftwarePlaybackHost regardless
     // of codec (TEST-ONLY routing override). Lets the H.264 fixture
     // exercise the SW live + DVR path end-to-end.
@@ -263,6 +268,7 @@ if first == "live" {
     exit(runLive(seconds: seconds, seed: seed, dvrWindow: dvrWindow,
                  serveOnly: serveOnly, measureRSS: measureRSS,
                  reportCacheBytes: reportCacheBytes, rewindTest: rewindTest,
+                 reloadTest: reloadTest,
                  forceSoftware: forceSW, dropAfter: dropAfter,
                  discontinuityAt: discontinuityAt, realtime: realtime))
 }

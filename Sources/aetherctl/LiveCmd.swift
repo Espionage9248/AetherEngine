@@ -151,6 +151,7 @@ func runLive(
     measureRSS: Bool,
     reportCacheBytes: Bool,
     rewindTest: Bool = false,
+    reloadTest: Bool = false,
     forceSoftware: Bool = false,
     dropAfter: Double? = nil,
     discontinuityAt: Double? = nil,
@@ -225,6 +226,13 @@ func runLive(
         if rewindTest {
             box.value = await liveRewindTest(url: liveURL, seconds: playSeconds,
                                              dvrWindow: dvrWindow ?? 60)
+            fixture.stop()
+            CFRunLoopStop(CFRunLoopGetMain())
+            return
+        }
+        if reloadTest {
+            box.value = await liveReloadTest(url: liveURL, seconds: playSeconds,
+                                             dvrWindow: dvrWindow ?? 600)
             fixture.stop()
             CFRunLoopStop(CFRunLoopGetMain())
             return
@@ -396,6 +404,122 @@ private func liveSmokeTest(url: URL, seconds playSeconds: Double,
     }
     print(String(format: "VERDICT: live FAIL (isLive=%@, state=%@, t=%.2fs, edge=%.2fs, needed >=%.2fs)",
                  "\(finalIsLive)", "\(finalState)", finalTime, finalEdge, advanceTarget))
+    return 1
+}
+
+/// Live-RELOAD test: the manual macOS repro for the tvOS live-reload
+/// stall (audio-switch / background-return reload of a live session
+/// left AVPlayer in waitingToPlay forever, frozen frame).
+///
+/// Shape of the repro: load the fixture as a live session (DVR window
+/// 600 to match Sodalite's live load), play ~10 s, then call the
+/// public `reloadAtCurrentPosition()` — the background-return reopen,
+/// which exercises the same live REJOIN plumbing as the audio-switch
+/// reload (LiveReloadPolicy: no stale-clock resume, host skips the
+/// initial seek, readiness watchdog armed). The unpaced fixture serves
+/// a NEW connection from the seed start at I/O speed, which is exactly
+/// the Jellyfin behavior that produced the stalling backlog join: the
+/// rebuilt producer races through tens of seconds of content before
+/// AVPlayer's first playlist fetch.
+///
+/// PASS: the rejoined session reaches .playing and its clock advances
+/// within the post-reload observation window. FAIL: state lands in
+/// .error (watchdog or load failure) or the clock never moves (the
+/// historical frozen-frame wedge).
+@MainActor
+private func liveReloadTest(url: URL, seconds playSeconds: Double,
+                            dvrWindow: Double) async -> Int32 {
+    let engine: AetherEngine
+    do {
+        engine = try AetherEngine()
+    } catch {
+        print("VERDICT: live-reload FAIL: engine init error: \(error.localizedDescription)")
+        return 1
+    }
+
+    var options = LoadOptions(isLive: true)
+    options.suppressDisplayCriteria = true
+    options.dvrWindowSeconds = dvrWindow
+
+    do {
+        try await engine.load(url: url, options: options)
+    } catch {
+        print("VERDICT: live-reload FAIL: initial load error: \(error.localizedDescription)")
+        engine.stop()
+        return 1
+    }
+
+    // Warm up: let the initial join reach steady playback so the reload
+    // happens mid-session (matching the device repro's resumeAt=25 s).
+    let warmup = max(8.0, min(playSeconds, 20.0))
+    print(String(format: "  warmup %.0fs before reload ...", warmup))
+    for i in 0..<Int(warmup) {
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        if i % 4 == 0 {
+            print(String(format: "    +%2ds state=%@ t=%.2f edge=%.2f",
+                         i + 1, "\(engine.state)", engine.currentTime, engine.liveEdgeTime))
+        }
+    }
+    let preReloadTime = engine.currentTime
+    guard case .playing = engine.state else {
+        print("VERDICT: live-reload FAIL: warmup never reached .playing (state=\(engine.state))")
+        engine.stop()
+        return 1
+    }
+
+    print(String(format: "  RELOAD at t=%.2fs (reloadAtCurrentPosition, live rejoin)", preReloadTime))
+    do {
+        try await engine.reloadAtCurrentPosition()
+    } catch {
+        print("VERDICT: live-reload FAIL: reload threw: \(error.localizedDescription)")
+        engine.stop()
+        return 1
+    }
+
+    // Observe the rejoin. The historical wedge showed state=.playing
+    // engine-side with the AVPlayer clock frozen at 0.00 forever, so
+    // the verdict keys on CLOCK MOVEMENT, not on state alone. 25 s
+    // gives the 10 s readiness watchdog room to fire (an .error here
+    // is a CLEAN failure mode, but for the fixture it means the rejoin
+    // genuinely did not come up, so the test still fails loudly).
+    var baseline: Double? = nil
+    var advanced = false
+    for i in 0..<25 {
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        let state = engine.state
+        let t = engine.currentTime
+        print(String(format: "    +%2ds state=%@ t=%.2f edge=%.2f behind=%.2f",
+                     i + 1, "\(state)", t, engine.liveEdgeTime, engine.behindLiveSeconds))
+        if case .error(let msg) = state {
+            print("VERDICT: live-reload FAIL: rejoin errored: \(msg)")
+            engine.stop()
+            return 1
+        }
+        if case .playing = state {
+            // First playing tick after the reload is the clock baseline;
+            // movement is judged relative to it (the rejoined timeline
+            // restarts, so absolute values are meaningless).
+            if baseline == nil { baseline = t }
+            if let b = baseline, t - b >= 3.0 {
+                advanced = true
+                break
+            }
+        }
+    }
+
+    let finalState = engine.state
+    let finalTime = engine.currentTime
+    engine.stop()
+
+    if advanced {
+        print(String(format: "VERDICT: live-reload OK (rejoined, state=%@, clock advanced to %.2fs)",
+                     "\(finalState)", finalTime))
+        return 0
+    }
+    print(String(format: "VERDICT: live-reload FAIL (state=%@, t=%.2fs, clock never advanced "
+                 + ">=3s past the rejoin baseline %@ — the frozen-frame wedge signature)",
+                 "\(finalState)", finalTime,
+                 baseline.map { String(format: "%.2fs", $0) } ?? "n/a"))
     return 1
 }
 
