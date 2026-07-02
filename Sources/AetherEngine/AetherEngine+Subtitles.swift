@@ -5,6 +5,18 @@ import Libavutil
 
 extension AetherEngine {
 
+    /// Whether the side-demuxer should prewarm the container's cue table
+    /// with a mid-file seek before the real seek-to-playhead. On a no-index
+    /// remote MKV that seek degrades into a 30-45 s linear HTTP scan
+    /// (device-confirmed), so: never when the container advertises no
+    /// duration (those files have no Cues to load), and never when the
+    /// caller knows the source is unseekable and says so.
+    nonisolated static func shouldPrewarmSubtitleCueTable(
+        durationSeconds: Double, skipPrewarmHint: Bool
+    ) -> Bool {
+        !skipPrewarmHint && durationSeconds > 0
+    }
+
     /// Activate an embedded subtitle stream from the source. A side
     /// Demuxer opens the source independently of the main HLS pump,
     /// seeks to (just before) the current playback position, and
