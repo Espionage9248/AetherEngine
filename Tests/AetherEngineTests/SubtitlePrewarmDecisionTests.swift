@@ -9,10 +9,11 @@ struct SubtitlePrewarmDecisionTests {
         #expect(AetherEngine.shouldPrewarmSubtitleCueTable(durationSeconds: 5621, skipPrewarmHint: false))
     }
 
-    @Test("Zero or negative duration never prewarms (no-Cues class reads dur=0)")
+    @Test("Zero, negative, or NaN duration never prewarms (no-Cues class reads dur=0)")
     func zeroDurationSkips() {
         #expect(!AetherEngine.shouldPrewarmSubtitleCueTable(durationSeconds: 0, skipPrewarmHint: false))
         #expect(!AetherEngine.shouldPrewarmSubtitleCueTable(durationSeconds: -1, skipPrewarmHint: false))
+        #expect(!AetherEngine.shouldPrewarmSubtitleCueTable(durationSeconds: .nan, skipPrewarmHint: false))
     }
 
     @Test("Caller hint forces the skip even when a duration is advertised")
