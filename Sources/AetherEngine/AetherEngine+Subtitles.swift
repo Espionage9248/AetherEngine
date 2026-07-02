@@ -65,20 +65,46 @@ extension AetherEngine {
         startEmbeddedSubtitleTask(url: url, reader: customClone, formatHint: customFormatHint, streamIndex: Int32(index), startAt: sourceTime)
     }
 
+    /// Run the embedded-subtitle side demuxer on an engine instance that
+    /// has NOT done a bridged `load()` — for hosts that play the video by
+    /// other means (e.g. an HLS transcode in AVPlayer) but want the source
+    /// file's embedded subtitle tracks. The caller supplies the source
+    /// URL, FFmpeg stream index, start position, and HTTP headers
+    /// (normally read from `loadedOptions`, which only `load()` sets).
+    /// Decoded cues accumulate into `subtitleCues` exactly as on the
+    /// bridged path; pace the read-ahead by pushing the external playhead
+    /// via `updateExternalPlayhead(_:)`. Calling this again restarts the
+    /// reader at the new `startAt` (cancels the previous one and clears
+    /// `subtitleCues`) — that is the scrub path. Video dimensions fall
+    /// back to 1920x1080 for bitmap cue positioning.
+    public func startStandaloneEmbeddedSubtitleReader(
+        url: URL, streamIndex: Int, startAt: Double,
+        httpHeaders: [String: String] = [:], skipPrewarm: Bool = false
+    ) {
+        cancelSidecarTask()
+        cancelEmbeddedSubtitleReader()
+        isSubtitleActive = true
+        subtitleCues = []
+        isLoadingSubtitles = true
+        activeEmbeddedSubtitleStreamIndex = Int32(streamIndex)
+        startEmbeddedSubtitleTask(url: url, reader: nil, formatHint: nil, streamIndex: Int32(streamIndex), startAt: startAt, httpHeadersOverride: httpHeaders, skipPrewarm: skipPrewarm)
+    }
+
     /// Spin up the side-demuxer Task that streams cues into the
     /// engine. Captured-on-init: the URL, the stream index, the
     /// start position, and the source video dimensions. The Task's
     /// run loop is cancellable; `cancel()` triggers a clean exit.
-    func startEmbeddedSubtitleTask(url: URL, reader: IOReader?, formatHint: String?, streamIndex: Int32, startAt: Double) {
+    func startEmbeddedSubtitleTask(url: URL, reader: IOReader?, formatHint: String?, streamIndex: Int32, startAt: Double, httpHeadersOverride: [String: String]? = nil, skipPrewarm: Bool = false) {
         let w = sourceVideoWidth > 0 ? sourceVideoWidth : 1920
         let h = sourceVideoHeight > 0 ? sourceVideoHeight : 1080
-        let headers = loadedOptions.httpHeaders
+        let headers = httpHeadersOverride ?? loadedOptions.httpHeaders
         let preserveASS = loadedOptions.preserveASSMarkup
         embeddedSubtitleTask = Task.detached(priority: .userInitiated) { [weak self] in
             await self?.runEmbeddedSubtitleReader(
                 url: url, reader: reader, formatHint: formatHint,
                 headers: headers, streamIndex: streamIndex, startAt: startAt,
-                videoWidth: w, videoHeight: h, preserveASSMarkup: preserveASS
+                videoWidth: w, videoHeight: h, preserveASSMarkup: preserveASS,
+                skipPrewarm: skipPrewarm
             )
         }
     }
@@ -94,7 +120,8 @@ extension AetherEngine {
     nonisolated private func runEmbeddedSubtitleReader(
         url: URL, reader: IOReader?, formatHint: String?,
         headers: [String: String], streamIndex: Int32, startAt: Double,
-        videoWidth: Int32, videoHeight: Int32, preserveASSMarkup: Bool = false
+        videoWidth: Int32, videoHeight: Int32, preserveASSMarkup: Bool = false,
+        skipPrewarm: Bool = false
     ) async {
         let demuxer = Demuxer()
         // Register for abort: Task.cancel() is only observed BETWEEN
@@ -150,15 +177,11 @@ extension AetherEngine {
         }
 
         // Prewarm the cue table by seeking mid-file before the actual
-        // playhead seek. MKV cues live at the end of the file; a fresh
-        // demuxer doesn't load them until first seek. Without this
-        // prewarm, the seek-to-playhead lands inaccurately and we
-        // either miss subtitle packets near the playhead or land far
-        // away from where we asked. HLSVideoEngine does the same thing
-        // for the same reason; we mirror it on the side demuxer.
-        let duration = demuxer.duration
-        if duration > 0 {
-            demuxer.seek(to: duration * 0.5)
+        // playhead seek — but only when the container advertises a duration
+        // (no-duration files have no Cues to load; the seek would be a
+        // 30-45 s linear HTTP scan) and the caller didn't opt out.
+        if Self.shouldPrewarmSubtitleCueTable(durationSeconds: demuxer.duration, skipPrewarmHint: skipPrewarm) {
+            demuxer.seek(to: demuxer.duration * 0.5)
         }
 
         // Now the real seek. Slightly before the playhead so bitmap
