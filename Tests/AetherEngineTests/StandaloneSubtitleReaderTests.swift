@@ -17,4 +17,11 @@ struct StandaloneSubtitleReaderTests {
         e.clearSubtitle()
         #expect(!e.isSubtitleActive)
     }
+
+    @Test("External playhead feed writes the source clock")
+    func externalPlayheadWritesClock() throws {
+        let e = try AetherEngine()
+        e.updateExternalPlayhead(42.5)
+        #expect(e.sourceTime == 42.5)
+    }
 }

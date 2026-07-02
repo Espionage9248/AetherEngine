@@ -90,6 +90,18 @@ extension AetherEngine {
         startEmbeddedSubtitleTask(url: url, reader: nil, formatHint: nil, streamIndex: Int32(streamIndex), startAt: startAt, httpHeadersOverride: httpHeaders, skipPrewarm: skipPrewarm)
     }
 
+    /// Feed an external playhead (seconds, source timeline) into the
+    /// engine clock. Intended ONLY for engines used as standalone
+    /// subtitle extractors (no `load()`): the host's own player owns the
+    /// real clock, and the side reader paces its read-ahead window and
+    /// cue pruning against `sourceTime`, which nothing else writes on a
+    /// load()-less engine. The parked reader re-polls `sourceTime` every
+    /// 500 ms, so pushes un-park it automatically. Do not call this on an
+    /// engine doing bridged playback — its own clock would fight the push.
+    public func updateExternalPlayhead(_ seconds: Double) {
+        clock.sourceTime = seconds
+    }
+
     /// Spin up the side-demuxer Task that streams cues into the
     /// engine. Captured-on-init: the URL, the stream index, the
     /// start position, and the source video dimensions. The Task's
