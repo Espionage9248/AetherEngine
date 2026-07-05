@@ -1,13 +1,12 @@
 {
-  "originHash" : "c957f8d0c9b14387972f17f4a50de795c0268f76378b9676a645f680f6285f46",
+  "originHash" : "84e13969069197ffc3f873e76f2464870a7a117b246cbccce3c6bec93d2b59d0",
   "pins" : [
     {
       "identity" : "ffmpegbuild",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/superuser404notfound/FFmpegBuild",
+      "location" : "https://github.com/Espionage9248/FFmpegBuild",
       "state" : {
-        "branch" : "main",
-        "revision" : "91572ea3d31ca1fa6aa3d3df572bbc0b2912f585"
+        "revision" : "5329cdd58d000373fc85fd19dc30ddceac6a4985"
       }
     }
   ],
