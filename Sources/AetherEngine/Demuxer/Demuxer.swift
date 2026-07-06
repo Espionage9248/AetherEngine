@@ -569,6 +569,19 @@ public final class Demuxer: @unchecked Sendable {
         }
     }
 
+    /// Keyframe-only demux for the preview sweep (#158 v2): mark `streamIndex`
+    /// with `AVDISCARD_NONKEY` so `av_read_frame` drops its non-key packets
+    /// inside the demuxer. Demux-level only — no decoder is involved, so the
+    /// FrameDecodeContext caveat about decoder-level NONKEY does not apply.
+    func discardNonKeyPackets(streamIndex: Int32) {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        guard let ctx = formatContext,
+              streamIndex >= 0, streamIndex < Int32(ctx.pointee.nb_streams),
+              let stream = ctx.pointee.streams[Int(streamIndex)] else { return }
+        stream.pointee.discard = AVDISCARD_NONKEY
+    }
+
     /// Enumerate the source's keyframe positions for the given stream
     /// from libavformat's index, returning each entry's `timestamp`
     /// field in the stream's native timebase.
