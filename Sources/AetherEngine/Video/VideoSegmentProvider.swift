@@ -386,6 +386,18 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         return cache.peekURL(index: index)
     }
 
+    /// Side-effect-free counterpart to `mediaSegmentURL(at:)` for
+    /// trick-play preview (byte-range) fetches: a pure `cache.peekURL`
+    /// with NO `handleTargetChange` — no `declareTarget`, no window
+    /// extension, no producer restart. A preview probe for a segment
+    /// outside the resident window simply returns nil (the server then
+    /// 404s), so a scrub gesture can never retarget the cache/producer
+    /// away from the play position.
+    func previewSegmentURL(at index: Int) -> URL? {
+        guard index >= 0, index < currentSegmentCount else { return nil }
+        return cache.peekURL(index: index)
+    }
+
     /// Update the cache's target index AND, if the change represents
     /// a big backward jump, proactively relocate the producer.
     /// Shared by both `mediaSegment(at:)` (Data path) and

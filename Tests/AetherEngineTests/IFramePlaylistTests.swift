@@ -25,13 +25,16 @@ private final class IFrameVODProvider: HLSSegmentProvider, @unchecked Sendable {
     let codecs: String
     let width: Int
     let height: Int
+    let videoRange: HLSVideoRange?
 
     init(count: Int, codecs: String = "avc1.640029,mp4a.40.2",
-         width: Int = 1920, height: Int = 1080) {
+         width: Int = 1920, height: Int = 1080,
+         videoRange: HLSVideoRange? = nil) {
         self.count = count
         self.codecs = codecs
         self.width = width
         self.height = height
+        self.videoRange = videoRange
     }
 
     func initSegment() -> Data? { Data([0x00]) }
@@ -42,6 +45,7 @@ private final class IFrameVODProvider: HLSSegmentProvider, @unchecked Sendable {
 
     var masterCodecs: String? { codecs }
     var masterResolution: (width: Int, height: Int)? { (width, height) }
+    var masterVideoRange: HLSVideoRange? { videoRange }
     var masterBandwidth: Int? { 6_000_000 }
 }
 
@@ -169,5 +173,121 @@ struct IFramePlaylistTests {
     @Test("a start beyond EOF is unsatisfiable and falls back to a full 200")
     func rangeStartBeyondEOF() {
         #expect(HLSLocalServer.parseByteRange("bytes=5000-6000", totalSize: 1000) == nil)
+    }
+
+    // MARK: - Part B2: VIDEO-RANGE on the I-frame line (#158 review I1)
+
+    @Test("the I-frame line carries VIDEO-RANGE, mirroring the STREAM-INF main variant")
+    func iframeLineCarriesVideoRange() {
+        // An HDR/DV-8.x master (video-only codec is plain hvc1, so the
+        // I-frame line IS emitted) with a PQ range. Absent VIDEO-RANGE means
+        // SDR per HLS, so the I-frame variant must state PQ explicitly to
+        // stay consistent with the PQ main variant.
+        let provider = IFrameVODProvider(count: 3, codecs: "hvc1.2.4.L153.90",
+                                         videoRange: .pq)
+        let ls = lines(HLSLocalServer.buildMasterPlaylistText(provider: provider))
+
+        guard let iframeLine = ls.first(where: { $0.hasPrefix("#EXT-X-I-FRAME-STREAM-INF:") }),
+              let streamLine = ls.first(where: { $0.hasPrefix("#EXT-X-STREAM-INF:") }) else {
+            Issue.record("master missing STREAM-INF or I-FRAME-STREAM-INF line")
+            return
+        }
+        #expect(iframeLine.contains("VIDEO-RANGE=PQ"))
+        // The I-frame variant's range must match the main variant's.
+        #expect(streamLine.contains("VIDEO-RANGE=PQ"))
+    }
+
+    @Test("no provider range means no VIDEO-RANGE on the I-frame line (implicit SDR, unchanged)")
+    func iframeLineOmitsVideoRangeWhenNil() {
+        // The default stub reports no masterVideoRange; the attribute is
+        // simply absent (implicit SDR), exactly as before the fix.
+        let provider = IFrameVODProvider(count: 3)
+        let ls = lines(HLSLocalServer.buildMasterPlaylistText(provider: provider))
+        let iframeLine = ls.first(where: { $0.hasPrefix("#EXT-X-I-FRAME-STREAM-INF:") })
+        #expect(iframeLine != nil)
+        #expect(iframeLine?.contains("VIDEO-RANGE") == false)
+    }
+
+    // MARK: - Part B3: skip the I-frame line for Dolby Vision (#158 review I2)
+
+    @Test("a Dolby Vision (dvh1) master advertises NO I-frame line")
+    func dolbyVisionMasterHasNoIFrameLine() {
+        // DV Profile 5's video-only codec is dvh1.05.06; the P5 master must
+        // return to its pre-#158 shape (no trick-play line).
+        let provider = IFrameVODProvider(count: 3, codecs: "dvh1.05.06",
+                                         videoRange: .pq)
+        let master = HLSLocalServer.buildMasterPlaylistText(provider: provider)
+        #expect(!master.contains("#EXT-X-I-FRAME-STREAM-INF"))
+    }
+
+    @Test("an hvc1 (DV 8.x / HDR base) master still advertises the I-frame line")
+    func hvc1MasterKeepsIFrameLine() {
+        // DV 8.x advertises a plain hvc1 video-only codec, so it is NOT
+        // treated as DV here and keeps previews (only bare dvh1 is skipped).
+        let provider = IFrameVODProvider(count: 3, codecs: "hvc1.2.4.L153.90",
+                                         videoRange: .pq)
+        let master = HLSLocalServer.buildMasterPlaylistText(provider: provider)
+        #expect(master.contains("#EXT-X-I-FRAME-STREAM-INF"))
+    }
+
+    // MARK: - Part E: preview fetch is side-effect-free (#158 review C1)
+
+    /// Records producer-restart callbacks so a test can assert a preview
+    /// fetch never triggers one.
+    private final class RestartSpy: @unchecked Sendable {
+        var calls: [Int] = []
+    }
+
+    @Test("previewSegmentURL is a pure peek (no declareTarget / restart); mediaSegmentURL retargets")
+    func previewSegmentURLIsSideEffectFree() {
+        let cache = SegmentCache()
+        // Seed segment 0 resident; segments 1..9 stay non-resident.
+        cache.store(index: 0, data: Data([0x01, 0x02, 0x03, 0x04]))
+
+        let spy = RestartSpy()
+        let segments = (0..<10).map { i in
+            HLSVideoEngine.Segment(startPts: 0, endPts: 0,
+                                   startSeconds: Double(i) * 4.0,
+                                   durationSeconds: 4.0)
+        }
+        let provider = VideoSegmentProvider(
+            cache: cache,
+            segments: segments,
+            codecsString: "avc1.640029,mp4a.40.2",
+            supplementalCodecs: nil,
+            resolution: (1920, 1080),
+            videoRange: .sdr,
+            frameRate: nil,
+            hdcpLevel: nil,
+            sourceBitrate: 6_000_000,
+            restartHandler: { spy.calls.append($0) })
+
+        // No fetch has declared a cache target yet.
+        #expect(cache.targetIndex == -1)
+
+        // Preview of a RESIDENT segment: returns the file URL and drives NO
+        // side effect — the cache target stays -1, the producer never
+        // restarts. This is the C1 fix: a trick-play byte-range fetch must
+        // not retarget the cache away from the play position.
+        #expect(provider.previewSegmentURL(at: 0) != nil)
+        #expect(cache.targetIndex == -1)
+        #expect(spy.calls.isEmpty)
+
+        // Preview of an in-bounds but NON-resident segment: graceful nil,
+        // still no retarget / restart (the server turns this into a 404).
+        #expect(provider.previewSegmentURL(at: 5) == nil)
+        #expect(cache.targetIndex == -1)
+        #expect(spy.calls.isEmpty)
+
+        // Out-of-bounds preview: nil via the bounds guard, no side effect.
+        #expect(provider.previewSegmentURL(at: 999) == nil)
+        #expect(cache.targetIndex == -1)
+        #expect(spy.calls.isEmpty)
+
+        // CONTRAST — the playback path legitimately retargets: mediaSegmentURL
+        // for the same resident segment declares the cache target (exactly the
+        // side effect the preview path must avoid).
+        #expect(provider.mediaSegmentURL(at: 0) != nil)
+        #expect(cache.targetIndex == 0)
     }
 }

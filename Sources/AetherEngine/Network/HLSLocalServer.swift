@@ -30,6 +30,15 @@ protocol HLSSegmentProvider: AnyObject {
     /// `sendfile(2)` approach is SIGSYS-blocked by the tvOS sandbox).
     func mediaSegmentURL(at index: Int) -> URL?
 
+    /// Side-effect-free segment-URL lookup for trick-play preview
+    /// (byte-range / I-frame) fetches. Unlike `mediaSegmentURL(at:)` this
+    /// MUST NOT `declareTarget`, extend the visible window, or restart the
+    /// producer, so a preview probe for a far-off segment can never
+    /// retarget the cache away from the play position (#158 review). Returns
+    /// nil when the segment isn't resident — a missing preview is graceful
+    /// (the server answers 404 and AVKit falls back to a time-only scrub).
+    func previewSegmentURL(at index: Int) -> URL?
+
     /// Number of segments currently known. May grow over time for
     /// `.event` playlists, fixed for `.vod` playlists.
     var segmentCount: Int { get }
@@ -177,6 +186,11 @@ extension HLSSegmentProvider {
     /// disk override to return the file URL so the server can use
     /// the file-streaming fast path (no Data materialization).
     func mediaSegmentURL(at index: Int) -> URL? { nil }
+
+    /// Default: no resident file backing (memory-only / non-cache
+    /// providers). A provider with a segment cache overrides this to
+    /// return the cached file URL with no side effects.
+    func previewSegmentURL(at index: Int) -> URL? { nil }
 
     /// Default: append-only / VOD playlists always start at segment 0.
     var firstVisibleSegmentIndex: Int { 0 }
@@ -359,7 +373,14 @@ final class HLSLocalServer: @unchecked Sendable {
     /// than the media playlist) only when this is true, so tvOS AVKit can
     /// fetch the I-frame playlist for seek-preview thumbnails.
     var advertisesIFrameStream: Bool {
-        provider?.masterVideoOnlyCodecs != nil
+        // Mirror buildMasterPlaylistText's DV guard: a dvh1 video-only codec
+        // emits NO I-frame line (#158 review I2), so the master genuinely
+        // advertises no trick-play stream. This getter is consulted only in
+        // HLSVideoEngine's SDR master-routing branch, where the codec is
+        // never dvh1, so the DV guard is inert there and simply keeps
+        // `advertisesIFrameStream` ⟺ an iframe line is actually emitted.
+        guard let videoOnly = provider?.masterVideoOnlyCodecs else { return false }
+        return !videoOnly.lowercased().hasPrefix("dvh")
     }
 
     /// Number of segments currently published.
@@ -880,7 +901,15 @@ final class HLSLocalServer: @unchecked Sendable {
                 if firstTime { loggedIFramePlaylist = true }
                 stateLock.unlock()
                 if firstTime {
-                    EngineLog.emit("[HLSLocalServer] iframe.m3u8 body:\n\(body)",
+                    // Head/tail only: an I-frames-only VOD playlist is ~one
+                    // line per segment (~1800 for a 2h asset); mirror the
+                    // media handler rather than dumping the whole body once.
+                    let lines = body.split(separator: "\n", omittingEmptySubsequences: false)
+                    let head = lines.prefix(8).joined(separator: "\n")
+                    let tail = lines.suffix(6).joined(separator: "\n")
+                    EngineLog.emit("[HLSLocalServer] iframe.m3u8 head:\n\(head)",
+                                   category: .hlsServer)
+                    EngineLog.emit("[HLSLocalServer] iframe.m3u8 tail:\n\(tail)",
                                    category: .hlsServer)
                 }
                 return send200(fd: fd, path: normalizedPath,
@@ -908,6 +937,27 @@ final class HLSLocalServer: @unchecked Sendable {
                         if seg0FetchTime == nil { seg0FetchTime = Date() }
                         stateLock.unlock()
                     }
+                    // A Range request is a trick-play I-frame byte-range
+                    // extraction (#158), never a sequential playback fetch:
+                    // the media playlist carries no byte ranges, so only
+                    // iframe.m3u8 entries produce Range requests. Serve it
+                    // side-effect-free from a resident cache file via
+                    // `previewSegmentURL` — NO declareTarget / window
+                    // extension / producer restart — so a scrub preview for a
+                    // far-off segment cannot retarget the cache away from the
+                    // play position (#158 review C1). A non-resident preview
+                    // is a graceful 404; it MUST NOT fall through to the
+                    // blocking `mediaSegment(at:)` producer-restart path.
+                    if let rangeHeader {
+                        if let url = provider?.previewSegmentURL(at: index) {
+                            return send206OrFullFile(fd: fd, path: normalizedPath,
+                                                     fileURL: url, rangeHeader: rangeHeader)
+                        }
+                        return send404(fd: fd, path: normalizedPath,
+                                       reason: "preview segment[\(index)] not resident")
+                    }
+                    // Playback (non-Range) path — unchanged. These fetches
+                    // legitimately drive the cache window + producer restart.
                     // Fast path: if the segment is file-backed (cache
                     // adopt path), stream the file directly
                     // from the page cache to the socket — bypasses
@@ -916,26 +966,12 @@ final class HLSLocalServer: @unchecked Sendable {
                     // materializing the segment into anonymous heap
                     // per fetch, leaking ~one-segment-worth per serve.
                     if let url = provider?.mediaSegmentURL(at: index) {
-                        // A Range request (I-frame byte-range extraction, #158)
-                        // gets a 206 sliced response; the unchanged full-file
-                        // 200 path serves normal sequential playback fetches.
-                        if let rangeHeader {
-                            return send206OrFullFile(fd: fd, path: normalizedPath,
-                                                     fileURL: url, rangeHeader: rangeHeader)
-                        }
                         return send200File(fd: fd, path: normalizedPath,
                                             fileURL: url,
                                             contentType: "video/mp4")
                     }
                     if let data = provider?.mediaSegment(at: index),
                        !data.isEmpty {
-                        // Same Range handling for the in-memory fallback (a
-                        // segment produced but not yet flushed to a cache file).
-                        if let rangeHeader,
-                           let range = Self.parseByteRange(rangeHeader, totalSize: data.count) {
-                            return send206Data(fd: fd, path: normalizedPath, data: data,
-                                               range: range, contentType: "video/mp4")
-                        }
                         return send200(fd: fd, path: normalizedPath, data: data,
                                        contentType: "video/mp4")
                     }
@@ -1070,30 +1106,6 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         return streamFileToSocket(fileURL: fileURL, socketFd: fd, path: path,
                            expectedLength: length, startOffset: range.start)
-    }
-
-    /// Range-aware in-memory segment send: slices `[start, end]` out of the
-    /// provider's `Data` and returns `206 Partial Content`. The slice is at
-    /// most the I-frame byte-range length (≤ a few MiB), so the copy is
-    /// bounded — the whole point of byte-range extraction over whole-segment.
-    private func send206Data(fd: Int32, path: String, data: Data,
-                             range: (start: Int, end: Int), contentType: String) -> Bool {
-        let lower = data.startIndex + range.start
-        let upper = data.startIndex + range.end + 1
-        let slice = Data(data[lower..<upper])
-        let contentRange = "bytes \(range.start)-\(range.end)/\(data.count)"
-        let headerData = Self.responseHeader(
-            status: "206 Partial Content", contentLength: slice.count,
-            contentType: contentType,
-            extraHeaders: ["Content-Range: \(contentRange)", "Accept-Ranges: bytes"])
-
-        EngineLog.emit("[HLSLocalServer] -> 206 \(path) \(contentRange) bytes=\(slice.count)",
-                       category: .hlsServer)
-
-        guard writeAll(fd: fd, data: headerData, path: "\(path) [header]") else {
-            return false
-        }
-        return writeAll(fd: fd, data: slice, path: path)
     }
 
     private func send404(fd: Int32, path: String, reason: String) -> Bool {
@@ -1334,15 +1346,33 @@ final class HLSLocalServer: @unchecked Sendable {
         // the transport-bar scrubbing filmstrip (Apple HLS Authoring Spec
         // 6.1). Its URI is an attribute on the tag itself (not a following
         // line, unlike EXT-X-STREAM-INF) per RFC 8216 §4.3.4.3, and its
-        // CODECS MUST be video-only (spec 9.3). Emitted whenever the
-        // provider supplies a video-only CODECS — i.e. whenever a master is
-        // published — for SDR, HDR, and DV alike.
-        if let iframeCodecs = provider.masterVideoOnlyCodecs {
+        // CODECS MUST be video-only (spec 9.3). Emitted whenever the provider
+        // supplies a non-DV video-only CODECS (SDR avc1 / HDR / DV 8.x hvc1);
+        // the DV Profile 5 (dvh1) case is skipped just below.
+        // Skip the I-frame line for a Dolby Vision (dvh1.*) video-only codec.
+        // Emitting a dvh1 #EXT-X-I-FRAME-STREAM-INF on the P5 master (which
+        // P5-on-DV-panel routes to) is unproven on a working flagship path, so
+        // restore DV to its exact pre-#158 state — no previews, unchanged
+        // playback (#158 review I2). SDR (avc1) and DV 8.x (video-only codec
+        // is plain hvc1) are unaffected and keep previews.
+        if let iframeCodecs = provider.masterVideoOnlyCodecs,
+           !iframeCodecs.lowercased().hasPrefix("dvh") {
             var iframeAttrs: [String] = []
             iframeAttrs.append("BANDWIDTH=\(provider.masterBandwidth ?? 5_000_000)")
             iframeAttrs.append("CODECS=\"\(iframeCodecs)\"")
             if let resolution = provider.masterResolution {
                 iframeAttrs.append("RESOLUTION=\(resolution.width)x\(resolution.height)")
+            }
+            // VIDEO-RANGE MUST match the STREAM-INF above (mirror the main
+            // variant exactly). An absent VIDEO-RANGE means SDR per HLS, so on
+            // an HDR/DV master an I-frame variant without it advertises as
+            // implicitly-SDR beside a PQ main variant — internally
+            // inconsistent, tripping AVPlayer's HDR-path cliffs
+            // (−11848/−11868). For SDR masters this is explicit-SDR vs
+            // implicit-SDR, a behavioral no-op, so the Gate-0 SDR path is
+            // unchanged (#158 review I1).
+            if let range = provider.masterVideoRange {
+                iframeAttrs.append("VIDEO-RANGE=\(range.rawValue)")
             }
             iframeAttrs.append("URI=\"iframe.m3u8\"")
             lines.append("#EXT-X-I-FRAME-STREAM-INF:\(iframeAttrs.joined(separator: ","))")
