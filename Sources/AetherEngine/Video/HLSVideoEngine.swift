@@ -1416,9 +1416,23 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let dv5OnNonDVPanel = dvVariant == .profile5 && !effectiveDvMode
         let useMasterPlaylist: Bool
         if dv5OnNonDVPanel {
+            // DV Profile 5 on a non-DV panel MUST route via media.m3u8: the
+            // dvh1 master trips AVPlayer's strict master-level codec filter.
             useMasterPlaylist = false
+        } else if sourceIsHDR {
+            // HDR / DV with a ready panel routes at the master (VIDEO-RANGE=PQ
+            // and the DV attributes live there); a not-ready panel stays on
+            // media so AVPlayer never matches a PQ master against an SDR-locked
+            // panel (-11848 / -11868). Unchanged behavior.
+            useMasterPlaylist = panelReadyForHDR
         } else {
-            useMasterPlaylist = sourceIsHDR && panelReadyForHDR
+            // SDR: route at the master to expose the I-frame trick-play stream
+            // it advertises for transport-bar seek-preview thumbnails (#158). A
+            // plain SDR avc1/hvc1 master carries VIDEO-RANGE=SDR and a non-DV
+            // primary CODECS, so it does not trip the dvh1 master-refetch path
+            // that originally forced SDR onto media.m3u8. Falls back to media
+            // when no I-frame stream is advertised.
+            useMasterPlaylist = srv.advertisesIFrameStream
         }
         let resolvedURL: URL? = useMasterPlaylist
             ? srv.playlistURL

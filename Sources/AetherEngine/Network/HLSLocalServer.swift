@@ -87,6 +87,15 @@ protocol HLSSegmentProvider: AnyObject {
     var masterVideoRange: HLSVideoRange? { get }
     var masterBandwidth: Int? { get }
 
+    /// Video-only CODECS for the `EXT-X-I-FRAME-STREAM-INF` attribute the
+    /// master advertises for trick-play seek previews (#158). Apple's HLS
+    /// Authoring Spec 9.3 requires an I-frame stream to carry a CODECS
+    /// attribute and it MUST be video-only (no audio token). Defaults to
+    /// `masterCodecs` with the audio codec stripped — the video codec is
+    /// the first comma-component, since the manifest CODECS string is built
+    /// video-first (`"<video>,<audio>"`); nil when `masterCodecs` is nil.
+    var masterVideoOnlyCodecs: String? { get }
+
     /// SUPPLEMENTAL-CODECS attribute on `EXT-X-STREAM-INF`. Per
     /// Apple's HLS Authoring Spec Appendixes table, Dolby Vision
     /// Profile 8.1 advertises plain HEVC in `CODECS` and signals DV
@@ -180,6 +189,15 @@ extension HLSSegmentProvider {
     var masterResolution: (width: Int, height: Int)? { nil }
     var masterVideoRange: HLSVideoRange? { nil }
     var masterBandwidth: Int? { nil }
+
+    /// Default: derive the video-only CODECS from `masterCodecs` by taking
+    /// the component before the first comma (the video codec). The
+    /// production video provider builds `masterCodecs` video-first, so it
+    /// gets a spec-correct value for free with no override.
+    var masterVideoOnlyCodecs: String? {
+        guard let codecs = masterCodecs else { return nil }
+        return codecs.split(separator: ",", maxSplits: 1).first.map(String.init)
+    }
     var masterSupplementalCodecs: String? { nil }
     var masterFrameRate: Double? { nil }
     var masterAverageBandwidth: Int? { nil }
@@ -335,6 +353,15 @@ final class HLSLocalServer: @unchecked Sendable {
         return URL(string: "http://127.0.0.1:\(port)/media.m3u8")
     }
 
+    /// Whether the published master advertises an `EXT-X-I-FRAME-STREAM-INF`
+    /// trick-play variant (#158) — i.e. whether the provider supplies a
+    /// video-only CODECS. The host routes SDR playback at the master (rather
+    /// than the media playlist) only when this is true, so tvOS AVKit can
+    /// fetch the I-frame playlist for seek-preview thumbnails.
+    var advertisesIFrameStream: Bool {
+        provider?.masterVideoOnlyCodecs != nil
+    }
+
     /// Number of segments currently published.
     var segmentCount: Int {
         provider?.segmentCount ?? 0
@@ -405,6 +432,7 @@ final class HLSLocalServer: @unchecked Sendable {
     /// session instead of on every AVPlayer re-fetch.
     private var loggedMasterPlaylist = false
     private var loggedMediaPlaylist = false
+    private var loggedIFramePlaylist = false
     private var loggedRequestHeaders = false
     /// Count of /media.m3u8 builds. Used to periodically re-log the
     /// head/tail of a live sliding playlist so the advancing
@@ -524,6 +552,7 @@ final class HLSLocalServer: @unchecked Sendable {
         port = 0
         loggedMasterPlaylist = false
         loggedMediaPlaylist = false
+        loggedIFramePlaylist = false
         mediaPlaylistBuildCount = 0
         let clients = clientFds
         clientFds.removeAll()
@@ -732,6 +761,9 @@ final class HLSLocalServer: @unchecked Sendable {
             query = ""
         }
         let normalizedPath = (path == "/audio.m3u8") ? "/media.m3u8" : path
+        // Range request header (I-frame byte-range extraction, #158). nil for
+        // normal full-body playback and playlist fetches.
+        let rangeHeader = Self.rangeHeaderValue(from: text)
 
         EngineLog.emit("[HLSLocalServer] \(firstLine)", category: .hlsServer)
         // Dump full request headers on first request per session.
@@ -837,6 +869,26 @@ final class HLSLocalServer: @unchecked Sendable {
                            data: Data(body.utf8),
                            contentType: "application/vnd.apple.mpegurl")
 
+        case "/iframe.m3u8":
+            // I-frames-only playlist for trick-play seek previews (#158),
+            // present only when the master advertises the I-frame stream (a
+            // video-only CODECS), mirroring the master.m3u8 guard.
+            if provider?.masterVideoOnlyCodecs != nil {
+                let body = buildIFramePlaylist()
+                stateLock.lock()
+                let firstTime = !loggedIFramePlaylist
+                if firstTime { loggedIFramePlaylist = true }
+                stateLock.unlock()
+                if firstTime {
+                    EngineLog.emit("[HLSLocalServer] iframe.m3u8 body:\n\(body)",
+                                   category: .hlsServer)
+                }
+                return send200(fd: fd, path: normalizedPath,
+                               data: Data(body.utf8),
+                               contentType: "application/vnd.apple.mpegurl")
+            }
+            return send404(fd: fd, path: normalizedPath, reason: "no masterVideoOnlyCodecs")
+
         case "/init.mp4":
             let data = provider?.initSegment() ?? Data()
             if data.isEmpty {
@@ -864,12 +916,26 @@ final class HLSLocalServer: @unchecked Sendable {
                     // materializing the segment into anonymous heap
                     // per fetch, leaking ~one-segment-worth per serve.
                     if let url = provider?.mediaSegmentURL(at: index) {
+                        // A Range request (I-frame byte-range extraction, #158)
+                        // gets a 206 sliced response; the unchanged full-file
+                        // 200 path serves normal sequential playback fetches.
+                        if let rangeHeader {
+                            return send206OrFullFile(fd: fd, path: normalizedPath,
+                                                     fileURL: url, rangeHeader: rangeHeader)
+                        }
                         return send200File(fd: fd, path: normalizedPath,
                                             fileURL: url,
                                             contentType: "video/mp4")
                     }
                     if let data = provider?.mediaSegment(at: index),
                        !data.isEmpty {
+                        // Same Range handling for the in-memory fallback (a
+                        // segment produced but not yet flushed to a cache file).
+                        if let rangeHeader,
+                           let range = Self.parseByteRange(rangeHeader, totalSize: data.count) {
+                            return send206Data(fd: fd, path: normalizedPath, data: data,
+                                               range: range, contentType: "video/mp4")
+                        }
                         return send200(fd: fd, path: normalizedPath, data: data,
                                        contentType: "video/mp4")
                     }
@@ -900,7 +966,8 @@ final class HLSLocalServer: @unchecked Sendable {
     /// Response-header construction shared by the 200/200-file/404
     /// paths so the header shape can't drift between them.
     private static func responseHeader(
-        status: String, contentLength: Int, contentType: String?
+        status: String, contentLength: Int, contentType: String?,
+        extraHeaders: [String] = []
     ) -> Data {
         var header = "HTTP/1.1 \(status)\r\n"
         if let contentType {
@@ -911,8 +978,25 @@ final class HLSLocalServer: @unchecked Sendable {
             header += "Access-Control-Allow-Origin: *\r\n"
             header += "Cache-Control: no-cache\r\n"
         }
+        for extra in extraHeaders {
+            header += "\(extra)\r\n"
+        }
         header += "Connection: keep-alive\r\n\r\n"
         return Data(header.utf8)
+    }
+
+    /// Extract the `Range` request-header value (case-insensitive) from the
+    /// raw request text, or nil when absent. Only the value after `Range:`
+    /// is returned (e.g. `bytes=0-1048575`).
+    private static func rangeHeaderValue(from requestText: String) -> String? {
+        for line in requestText.components(separatedBy: "\r\n").dropFirst() {
+            if line.isEmpty { break } // blank line ends the header block
+            if line.lowercased().hasPrefix("range:") {
+                return String(line.dropFirst("range:".count))
+                    .trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return nil
     }
 
     private func send200(fd: Int32, path: String, data: Data, contentType: String) -> Bool {
@@ -952,6 +1036,64 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         return streamFileToSocket(fileURL: fileURL, socketFd: fd, path: path,
                            expectedLength: fileSize)
+    }
+
+    /// Range-aware file segment send (only called when a `Range` header is
+    /// present). Serves `206 Partial Content` for a satisfiable range — the
+    /// I-frame byte-range extraction path (#158), streaming only the sliced
+    /// bytes from the page cache — and falls back to the full-file 200 for an
+    /// unsatisfiable range so a stray Range never breaks normal playback.
+    private func send206OrFullFile(fd: Int32, path: String, fileURL: URL,
+                                   rangeHeader: String) -> Bool {
+        let fsAttrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
+        let fileSize = (fsAttrs?[.size] as? Int) ?? 0
+        if fileSize == 0 {
+            return send404(fd: fd, path: path,
+                           reason: "file \(fileURL.lastPathComponent) missing or empty")
+        }
+        guard let range = Self.parseByteRange(rangeHeader, totalSize: fileSize) else {
+            return send200File(fd: fd, path: path, fileURL: fileURL,
+                               contentType: "video/mp4")
+        }
+        let length = range.end - range.start + 1
+        let contentRange = "bytes \(range.start)-\(range.end)/\(fileSize)"
+        let headerData = Self.responseHeader(
+            status: "206 Partial Content", contentLength: length,
+            contentType: "video/mp4",
+            extraHeaders: ["Content-Range: \(contentRange)", "Accept-Ranges: bytes"])
+
+        EngineLog.emit("[HLSLocalServer] -> 206 \(path) \(contentRange) bytes=\(length) [filestream]",
+                       category: .hlsServer)
+
+        guard writeAll(fd: fd, data: headerData, path: "\(path) [header]") else {
+            return false
+        }
+        return streamFileToSocket(fileURL: fileURL, socketFd: fd, path: path,
+                           expectedLength: length, startOffset: range.start)
+    }
+
+    /// Range-aware in-memory segment send: slices `[start, end]` out of the
+    /// provider's `Data` and returns `206 Partial Content`. The slice is at
+    /// most the I-frame byte-range length (≤ a few MiB), so the copy is
+    /// bounded — the whole point of byte-range extraction over whole-segment.
+    private func send206Data(fd: Int32, path: String, data: Data,
+                             range: (start: Int, end: Int), contentType: String) -> Bool {
+        let lower = data.startIndex + range.start
+        let upper = data.startIndex + range.end + 1
+        let slice = Data(data[lower..<upper])
+        let contentRange = "bytes \(range.start)-\(range.end)/\(data.count)"
+        let headerData = Self.responseHeader(
+            status: "206 Partial Content", contentLength: slice.count,
+            contentType: contentType,
+            extraHeaders: ["Content-Range: \(contentRange)", "Accept-Ranges: bytes"])
+
+        EngineLog.emit("[HLSLocalServer] -> 206 \(path) \(contentRange) bytes=\(slice.count)",
+                       category: .hlsServer)
+
+        guard writeAll(fd: fd, data: headerData, path: "\(path) [header]") else {
+            return false
+        }
+        return writeAll(fd: fd, data: slice, path: path)
     }
 
     private func send404(fd: Int32, path: String, reason: String) -> Bool {
@@ -1020,8 +1162,12 @@ final class HLSLocalServer: @unchecked Sendable {
     /// are not sent; a short file fails the response (connection
     /// closes) instead of leaving the client waiting on a byte count
     /// that never completes.
+    ///
+    /// `startOffset` seeks the read cursor before streaming (default 0 = whole
+    /// file). The byte-range 206 path passes the range start so only
+    /// `expectedLength` bytes from that offset go on the wire.
     private func streamFileToSocket(fileURL: URL, socketFd: Int32, path: String,
-                             expectedLength: Int) -> Bool {
+                             expectedLength: Int, startOffset: Int = 0) -> Bool {
         let handle: FileHandle
         do {
             handle = try FileHandle(forReadingFrom: fileURL)
@@ -1032,6 +1178,15 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         let fileFd = handle.fileDescriptor
         defer { try? handle.close() }
+
+        if startOffset > 0 {
+            if lseek(fileFd, off_t(startOffset), SEEK_SET) < 0 {
+                let err = errno
+                EngineLog.emit("[HLSLocalServer] lseek failed \(path): errno=\(err) offset=\(startOffset)",
+                               category: .hlsServer)
+                return false
+            }
+        }
 
         let chunkSize = 256 * 1024
         let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: chunkSize)
@@ -1101,6 +1256,12 @@ final class HLSLocalServer: @unchecked Sendable {
                                             subResourceBaseURL: subResourceBaseURL)
     }
 
+    private func buildIFramePlaylist() -> String {
+        guard let provider = provider else { return "#EXTM3U\n" }
+        return Self.buildIFramePlaylistText(provider: provider,
+                                            subResourceBaseURL: subResourceBaseURL)
+    }
+
     /// Parse the LL-HLS `_HLS_msn` (Media Sequence Number) delivery
     /// directive from a request query string (e.g. `_HLS_msn=42` or
     /// `_HLS_msn=42&_HLS_part=0`). Returns nil when absent or unparseable,
@@ -1167,6 +1328,25 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         lines.append("#EXT-X-STREAM-INF:\(streamInfAttrs.joined(separator: ","))")
         lines.append("media.m3u8")
+
+        // Trick-play seek previews (#158): advertise an I-frame variant so
+        // tvOS AVKit fetches the #EXT-X-I-FRAMES-ONLY playlist and renders
+        // the transport-bar scrubbing filmstrip (Apple HLS Authoring Spec
+        // 6.1). Its URI is an attribute on the tag itself (not a following
+        // line, unlike EXT-X-STREAM-INF) per RFC 8216 §4.3.4.3, and its
+        // CODECS MUST be video-only (spec 9.3). Emitted whenever the
+        // provider supplies a video-only CODECS — i.e. whenever a master is
+        // published — for SDR, HDR, and DV alike.
+        if let iframeCodecs = provider.masterVideoOnlyCodecs {
+            var iframeAttrs: [String] = []
+            iframeAttrs.append("BANDWIDTH=\(provider.masterBandwidth ?? 5_000_000)")
+            iframeAttrs.append("CODECS=\"\(iframeCodecs)\"")
+            if let resolution = provider.masterResolution {
+                iframeAttrs.append("RESOLUTION=\(resolution.width)x\(resolution.height)")
+            }
+            iframeAttrs.append("URI=\"iframe.m3u8\"")
+            lines.append("#EXT-X-I-FRAME-STREAM-INF:\(iframeAttrs.joined(separator: ","))")
+        }
         return lines.joined(separator: "\n") + "\n"
     }
 
@@ -1350,6 +1530,123 @@ final class HLSLocalServer: @unchecked Sendable {
             lines.append("#EXT-X-ENDLIST")
         }
         return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// I-frames-only playlist for trick-play seek previews (#158). Mirrors
+    /// `buildMediaPlaylistText`: same atomic `notePlaylistBuild` snapshot,
+    /// same `firstVisible..<count` window, same init/segment URI scheme —
+    /// but declares `#EXT-X-I-FRAMES-ONLY` and gives every segment a FIXED
+    /// generous byte range at offset 0 in place of a whole-segment entry.
+    ///
+    /// FIXED byte range, not exact per-segment: the playlist lists all N
+    /// segments upfront from the keyframe plan WITHOUT muxing them, so exact
+    /// `#EXT-X-BYTERANGE` lengths don't exist yet — computing them would
+    /// force producing every segment upfront and defeat on-demand muxing.
+    /// Every segment is `moof`+`mdat` starting with its IDR at byte 0, so
+    /// `<LEN>@0` always covers `moof`+IDR. The server clamps the Range to
+    /// the real segment size (206 Content-Range), so an over-estimate is
+    /// safe and a too-small one only truncates a rare huge IDR (that one
+    /// preview is missing — graceful, no crash). LEN is resolution-scaled,
+    /// `max(1 MiB, width*height/2)` (≈1 MiB for ≤1080p, ≈4 MiB at 4K),
+    /// comfortably above one intra-coded keyframe's compressed size at any
+    /// sane bitrate. This needs NO muxer changes.
+    static func buildIFramePlaylistText(provider: HLSSegmentProvider,
+                                        subResourceBaseURL: URL? = nil) -> String {
+        // Same atomic snapshot discipline as buildMediaPlaylistText: one
+        // notePlaylistBuild() read, then build entirely from it (VOD returns
+        // a static snapshot; live's window advance is idempotent at a fixed
+        // segment total, so a media+iframe pair never double-evicts).
+        let snapshot = provider.notePlaylistBuild()
+        let count = snapshot.visibleCount
+        let firstVisible = min(snapshot.firstVisible, count)
+        let typeIsEvent = (provider.playlistType == .event && !snapshot.endlistAdded)
+        let typeIsLive = (provider.playlistType == .live && !snapshot.endlistAdded)
+
+        var maxDuration: Double = 0
+        for i in firstVisible..<count {
+            maxDuration = max(maxDuration, provider.segmentDuration(at: i))
+        }
+        let targetDuration = Int(ceil(max(1.0, maxDuration)))
+
+        // Fixed, generous, resolution-scaled byte-range length (see doc
+        // comment). Falls back to the 1 MiB floor when resolution is absent.
+        let byteRangeLength: Int
+        if let resolution = provider.masterResolution {
+            byteRangeLength = max(1_048_576, resolution.width * resolution.height / 2)
+        } else {
+            byteRangeLength = 1_048_576
+        }
+
+        var lines: [String] = []
+        lines.append("#EXTM3U")
+        lines.append("#EXT-X-VERSION:7")
+        lines.append("#EXT-X-TARGETDURATION:\(targetDuration)")
+        lines.append("#EXT-X-MEDIA-SEQUENCE:\(firstVisible)")
+        if typeIsEvent {
+            lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
+        } else if !typeIsLive {
+            lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
+        }
+        lines.append("#EXT-X-I-FRAMES-ONLY")
+
+        let initURI: String
+        let segURI: (Int) -> String
+        if let base = subResourceBaseURL {
+            let baseStr = base.absoluteString
+            let baseWithSlash = baseStr.hasSuffix("/") ? baseStr : baseStr + "/"
+            initURI = "\(baseWithSlash)init.mp4"
+            segURI = { idx in "\(baseWithSlash)seg\(idx).mp4" }
+        } else {
+            initURI = "init.mp4"
+            segURI = { idx in "seg\(idx).mp4" }
+        }
+        lines.append("#EXT-X-MAP:URI=\"\(initURI)\"")
+        for i in firstVisible..<count {
+            let dur = provider.segmentDuration(at: i)
+            lines.append("#EXTINF:\(String(format: "%.3f", dur)),")
+            lines.append("#EXT-X-BYTERANGE:\(byteRangeLength)@0")
+            lines.append(segURI(i))
+        }
+        if !typeIsLive && (snapshot.endlistAdded || !typeIsEvent) {
+            lines.append("#EXT-X-ENDLIST")
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// Parse an HTTP `Range` header value against a known resource size for
+    /// the byte-range I-frame extraction path (#158). Returns an inclusive
+    /// `[start, end]` to serve as `206 Partial Content`, or nil to serve the
+    /// full body as `200` (no/blank/unparseable header, or an unsatisfiable
+    /// start past EOF). `end` is clamped to `size - 1`, so an I-frame
+    /// playlist's generous `bytes=0-<LEN-1>` request over a smaller segment
+    /// resolves to the whole segment rather than failing. Only a single
+    /// `bytes=start-end` (end optional → through EOF) is supported, which is
+    /// all AVKit's I-frame extractor sends.
+    static func parseByteRange(_ headerValue: String?, totalSize: Int) -> (start: Int, end: Int)? {
+        guard totalSize > 0, let raw = headerValue else { return nil }
+        let value = raw.trimmingCharacters(in: .whitespaces)
+        guard value.hasPrefix("bytes=") else { return nil }
+        let spec = value.dropFirst("bytes=".count)
+        // Multi-range ("a-b,c-d") is not supported; reject if a comma appears.
+        guard !spec.contains(",") else { return nil }
+        let parts = spec.split(separator: "-", maxSplits: 1,
+                               omittingEmptySubsequences: false)
+        guard parts.count == 2, let start = Int(parts[0]), start >= 0 else {
+            return nil
+        }
+        // A start at or beyond EOF is unsatisfiable; fall back to a full 200.
+        guard start < totalSize else { return nil }
+        let requestedEnd: Int
+        if parts[1].isEmpty {
+            requestedEnd = totalSize - 1          // open-ended: through EOF
+        } else if let e = Int(parts[1]) {
+            requestedEnd = e
+        } else {
+            return nil
+        }
+        let end = min(requestedEnd, totalSize - 1) // clamp past-EOF to size-1
+        guard end >= start else { return nil }
+        return (start, end)
     }
 }
 
