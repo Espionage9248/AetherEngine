@@ -20,7 +20,7 @@ import Foundation
 /// protocol defaults. `masterVideoOnlyCodecs` is intentionally NOT
 /// overridden so these tests exercise the protocol's derive-from-masterCodecs
 /// default.
-private final class IFrameVODProvider: HLSSegmentProvider, @unchecked Sendable {
+private class IFrameVODProvider: HLSSegmentProvider, @unchecked Sendable {
     let count: Int
     let codecs: String
     let width: Int
@@ -47,6 +47,14 @@ private final class IFrameVODProvider: HLSSegmentProvider, @unchecked Sendable {
     var masterResolution: (width: Int, height: Int)? { (width, height) }
     var masterVideoRange: HLSVideoRange? { videoRange }
     var masterBandwidth: Int? { 6_000_000 }
+}
+
+/// EVENT variant of the VOD stub: identical metadata, non-VOD playlistType.
+/// The v2 master gate is VOD-only, so a non-VOD provider must NOT advertise
+/// the I-frame line (a live/EVENT variant would 404 the sweep-produced
+/// preview playlist).
+private final class IFrameEventProvider: IFrameVODProvider {
+    override var playlistType: HLSPlaylistType { .event }
 }
 
 struct IFramePlaylistTests {
@@ -105,35 +113,34 @@ struct IFramePlaylistTests {
         #expect(ls.contains("#EXT-X-PLAYLIST-TYPE:VOD"))
     }
 
-    @Test("every iframe entry carries a byte range at offset 0, one per segment")
-    func iframeByteRangesPerSegment() {
-        let provider = IFrameVODProvider(count: 5)
-        let iframe = HLSLocalServer.buildIFramePlaylistText(provider: provider)
-        let ls = lines(iframe)
-
-        let byteRanges = ls.filter { $0.hasPrefix("#EXT-X-BYTERANGE:") }
-        let extinfs = ls.filter { $0.hasPrefix("#EXTINF:") }
-        let segURIs = ls.filter { $0.hasPrefix("seg") }
-
-        #expect(byteRanges.count == 5)
-        #expect(extinfs.count == 5)
-        #expect(segURIs.count == 5)
-        // Every range starts at offset 0 (the IDR lives at byte 0 of every
-        // keyframe-aligned segment).
-        #expect(byteRanges.allSatisfy { $0.hasSuffix("@0") })
-        // LEN = max(1 MiB, w*h/2). At 1920x1080: w*h/2 = 1_036_800 < 1 MiB,
-        // so the 1 MiB floor governs. Pins the resolution-scaled formula.
-        #expect(byteRanges.allSatisfy { $0 == "#EXT-X-BYTERANGE:1048576@0" })
+    @Test("iframe entries are whole-file preview URIs (no byte ranges), one per segment")
+    func iframeEntriesAreWholeFilePreviewURIs() {
+        let provider = IFrameVODProvider(count: 3)
+        let text = HLSLocalServer.buildIFramePlaylistText(provider: provider)
+        #expect(text.contains("#EXT-X-I-FRAMES-ONLY"))
+        #expect(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"))
+        #expect(text.contains("#EXT-X-ENDLIST"))
+        #expect(text.contains("#EXT-X-MAP:URI=\"preview-init.mp4\""))
+        #expect(!text.contains("#EXT-X-BYTERANGE"))
+        for i in 0..<3 { #expect(text.contains("preview-\(i).m4s")) }
+        #expect(!text.contains("seg0.mp4"))
+        #expect(text.components(separatedBy: "#EXTINF").count - 1 == 3)
     }
 
-    @Test("iframe byte-range length scales up with resolution (4K)")
-    func iframeByteRangeScales4K() {
-        let provider = IFrameVODProvider(count: 2, width: 3840, height: 2160)
-        let iframe = HLSLocalServer.buildIFramePlaylistText(provider: provider)
-        // 3840*2160/2 = 4_147_200, above the 1 MiB floor.
-        #expect(lines(iframe).allSatisfy { line in
-            !line.hasPrefix("#EXT-X-BYTERANGE:") || line == "#EXT-X-BYTERANGE:4147200@0"
-        })
+    @Test("iframe entries honour the sub-resource base URL prefix")
+    func iframeEntriesUseSubResourceBase() {
+        let provider = IFrameVODProvider(count: 1)
+        let base = URL(string: "http://127.0.0.1:9/x")!
+        let text = HLSLocalServer.buildIFramePlaylistText(provider: provider, subResourceBaseURL: base)
+        #expect(text.contains("#EXT-X-MAP:URI=\"http://127.0.0.1:9/x/preview-init.mp4\""))
+        #expect(text.contains("http://127.0.0.1:9/x/preview-0.m4s"))
+    }
+
+    @Test("master skips the I-frame line for a non-VOD provider (v2 previews are VOD-only)")
+    func masterSkipsIFrameLineForNonVODProvider() {
+        let provider = IFrameEventProvider(count: 3)
+        let text = HLSLocalServer.buildMasterPlaylistText(provider: provider)
+        #expect(!text.contains("#EXT-X-I-FRAME-STREAM-INF"))
     }
 
     // MARK: - Part D: HTTP Range parsing / clamping
@@ -228,66 +235,5 @@ struct IFramePlaylistTests {
                                          videoRange: .pq)
         let master = HLSLocalServer.buildMasterPlaylistText(provider: provider)
         #expect(master.contains("#EXT-X-I-FRAME-STREAM-INF"))
-    }
-
-    // MARK: - Part E: preview fetch is side-effect-free (#158 review C1)
-
-    /// Records producer-restart callbacks so a test can assert a preview
-    /// fetch never triggers one.
-    private final class RestartSpy: @unchecked Sendable {
-        var calls: [Int] = []
-    }
-
-    @Test("previewSegmentURL is a pure peek (no declareTarget / restart); mediaSegmentURL retargets")
-    func previewSegmentURLIsSideEffectFree() {
-        let cache = SegmentCache()
-        // Seed segment 0 resident; segments 1..9 stay non-resident.
-        cache.store(index: 0, data: Data([0x01, 0x02, 0x03, 0x04]))
-
-        let spy = RestartSpy()
-        let segments = (0..<10).map { i in
-            HLSVideoEngine.Segment(startPts: 0, endPts: 0,
-                                   startSeconds: Double(i) * 4.0,
-                                   durationSeconds: 4.0)
-        }
-        let provider = VideoSegmentProvider(
-            cache: cache,
-            segments: segments,
-            codecsString: "avc1.640029,mp4a.40.2",
-            supplementalCodecs: nil,
-            resolution: (1920, 1080),
-            videoRange: .sdr,
-            frameRate: nil,
-            hdcpLevel: nil,
-            sourceBitrate: 6_000_000,
-            restartHandler: { spy.calls.append($0) })
-
-        // No fetch has declared a cache target yet.
-        #expect(cache.targetIndex == -1)
-
-        // Preview of a RESIDENT segment: returns the file URL and drives NO
-        // side effect — the cache target stays -1, the producer never
-        // restarts. This is the C1 fix: a trick-play byte-range fetch must
-        // not retarget the cache away from the play position.
-        #expect(provider.previewSegmentURL(at: 0) != nil)
-        #expect(cache.targetIndex == -1)
-        #expect(spy.calls.isEmpty)
-
-        // Preview of an in-bounds but NON-resident segment: graceful nil,
-        // still no retarget / restart (the server turns this into a 404).
-        #expect(provider.previewSegmentURL(at: 5) == nil)
-        #expect(cache.targetIndex == -1)
-        #expect(spy.calls.isEmpty)
-
-        // Out-of-bounds preview: nil via the bounds guard, no side effect.
-        #expect(provider.previewSegmentURL(at: 999) == nil)
-        #expect(cache.targetIndex == -1)
-        #expect(spy.calls.isEmpty)
-
-        // CONTRAST — the playback path legitimately retargets: mediaSegmentURL
-        // for the same resident segment declares the cache target (exactly the
-        // side effect the preview path must avoid).
-        #expect(provider.mediaSegmentURL(at: 0) != nil)
-        #expect(cache.targetIndex == 0)
     }
 }
