@@ -16,8 +16,10 @@ import Libavutil
 /// Timeline: fragments are stamped `source pts − firstKeyframePts`, the same
 /// media-timeline convention the playback producer uses for its tfdt, so the
 /// preview track maps onto the exact positions the playback segments occupy.
-/// (The `PreviewFragmentSource` protocol conformance is added in Task 8.)
-final class PreviewTrackProvider: @unchecked Sendable {
+/// Conforms to `PreviewFragmentSource`: its serving members are pure
+/// PreviewCache reads (below), which the whole-file I-frames-only playlist
+/// route consumes.
+final class PreviewTrackProvider: PreviewFragmentSource, @unchecked Sendable {
     private let sourceURL: URL
     private let httpHeaders: [String: String]
     private let plan: [HLSVideoEngine.Segment]

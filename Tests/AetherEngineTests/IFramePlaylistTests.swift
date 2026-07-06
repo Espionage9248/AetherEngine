@@ -20,7 +20,7 @@ import Foundation
 /// protocol defaults. `masterVideoOnlyCodecs` is intentionally NOT
 /// overridden so these tests exercise the protocol's derive-from-masterCodecs
 /// default.
-private final class IFrameVODProvider: HLSSegmentProvider, @unchecked Sendable {
+private class IFrameVODProvider: HLSSegmentProvider, @unchecked Sendable {
     let count: Int
     let codecs: String
     let width: Int
@@ -47,6 +47,14 @@ private final class IFrameVODProvider: HLSSegmentProvider, @unchecked Sendable {
     var masterResolution: (width: Int, height: Int)? { (width, height) }
     var masterVideoRange: HLSVideoRange? { videoRange }
     var masterBandwidth: Int? { 6_000_000 }
+}
+
+/// EVENT variant of the VOD stub: identical metadata, non-VOD playlistType.
+/// The v2 master gate is VOD-only, so a non-VOD provider must NOT advertise
+/// the I-frame line (a live/EVENT variant would 404 the sweep-produced
+/// preview playlist).
+private final class IFrameEventProvider: IFrameVODProvider {
+    override var playlistType: HLSPlaylistType { .event }
 }
 
 struct IFramePlaylistTests {
@@ -105,35 +113,34 @@ struct IFramePlaylistTests {
         #expect(ls.contains("#EXT-X-PLAYLIST-TYPE:VOD"))
     }
 
-    @Test("every iframe entry carries a byte range at offset 0, one per segment")
-    func iframeByteRangesPerSegment() {
-        let provider = IFrameVODProvider(count: 5)
-        let iframe = HLSLocalServer.buildIFramePlaylistText(provider: provider)
-        let ls = lines(iframe)
-
-        let byteRanges = ls.filter { $0.hasPrefix("#EXT-X-BYTERANGE:") }
-        let extinfs = ls.filter { $0.hasPrefix("#EXTINF:") }
-        let segURIs = ls.filter { $0.hasPrefix("seg") }
-
-        #expect(byteRanges.count == 5)
-        #expect(extinfs.count == 5)
-        #expect(segURIs.count == 5)
-        // Every range starts at offset 0 (the IDR lives at byte 0 of every
-        // keyframe-aligned segment).
-        #expect(byteRanges.allSatisfy { $0.hasSuffix("@0") })
-        // LEN = max(1 MiB, w*h/2). At 1920x1080: w*h/2 = 1_036_800 < 1 MiB,
-        // so the 1 MiB floor governs. Pins the resolution-scaled formula.
-        #expect(byteRanges.allSatisfy { $0 == "#EXT-X-BYTERANGE:1048576@0" })
+    @Test("iframe entries are whole-file preview URIs (no byte ranges), one per segment")
+    func iframeEntriesAreWholeFilePreviewURIs() {
+        let provider = IFrameVODProvider(count: 3)
+        let text = HLSLocalServer.buildIFramePlaylistText(provider: provider)
+        #expect(text.contains("#EXT-X-I-FRAMES-ONLY"))
+        #expect(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"))
+        #expect(text.contains("#EXT-X-ENDLIST"))
+        #expect(text.contains("#EXT-X-MAP:URI=\"preview-init.mp4\""))
+        #expect(!text.contains("#EXT-X-BYTERANGE"))
+        for i in 0..<3 { #expect(text.contains("preview-\(i).m4s")) }
+        #expect(!text.contains("seg0.mp4"))
+        #expect(text.components(separatedBy: "#EXTINF").count - 1 == 3)
     }
 
-    @Test("iframe byte-range length scales up with resolution (4K)")
-    func iframeByteRangeScales4K() {
-        let provider = IFrameVODProvider(count: 2, width: 3840, height: 2160)
-        let iframe = HLSLocalServer.buildIFramePlaylistText(provider: provider)
-        // 3840*2160/2 = 4_147_200, above the 1 MiB floor.
-        #expect(lines(iframe).allSatisfy { line in
-            !line.hasPrefix("#EXT-X-BYTERANGE:") || line == "#EXT-X-BYTERANGE:4147200@0"
-        })
+    @Test("iframe entries honour the sub-resource base URL prefix")
+    func iframeEntriesUseSubResourceBase() {
+        let provider = IFrameVODProvider(count: 1)
+        let base = URL(string: "http://127.0.0.1:9/x")!
+        let text = HLSLocalServer.buildIFramePlaylistText(provider: provider, subResourceBaseURL: base)
+        #expect(text.contains("#EXT-X-MAP:URI=\"http://127.0.0.1:9/x/preview-init.mp4\""))
+        #expect(text.contains("http://127.0.0.1:9/x/preview-0.m4s"))
+    }
+
+    @Test("master skips the I-frame line for a non-VOD provider (v2 previews are VOD-only)")
+    func masterSkipsIFrameLineForNonVODProvider() {
+        let provider = IFrameEventProvider(count: 3)
+        let text = HLSLocalServer.buildMasterPlaylistText(provider: provider)
+        #expect(!text.contains("#EXT-X-I-FRAME-STREAM-INF"))
     }
 
     // MARK: - Part D: HTTP Range parsing / clamping

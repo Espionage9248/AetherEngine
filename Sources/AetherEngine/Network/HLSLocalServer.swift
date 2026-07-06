@@ -181,6 +181,15 @@ protocol HLSSegmentProvider: AnyObject {
     func waitForLiveSegment(index: Int, timeout: TimeInterval) -> Bool
 }
 
+/// Source of whole-file preview fragments for the #158 v2
+/// #EXT-X-I-FRAMES-ONLY playlist. Both members are pure PreviewCache reads
+/// with no playback-side effects (never declareTarget / restart), so a
+/// preview fetch can't retarget the cache away from the play position (C1).
+protocol PreviewFragmentSource: AnyObject {
+    func previewInitData() -> Data?
+    func previewFragmentURL(forIndex index: Int) -> URL?
+}
+
 extension HLSSegmentProvider {
     /// Default: no file backing. Providers that store segments on
     /// disk override to return the file URL so the server can use
@@ -379,7 +388,11 @@ final class HLSLocalServer: @unchecked Sendable {
         // HLSVideoEngine's SDR master-routing branch, where the codec is
         // never dvh1, so the DV guard is inert there and simply keeps
         // `advertisesIFrameStream` ⟺ an iframe line is actually emitted.
-        guard let videoOnly = provider?.masterVideoOnlyCodecs else { return false }
+        // VOD-gate to match buildMasterPlaylistText: v2 previews are VOD-only,
+        // so a non-VOD master emits no I-frame line. Keeps the invariant
+        // `advertisesIFrameStream` ⟺ an iframe line is actually emitted.
+        guard let videoOnly = provider?.masterVideoOnlyCodecs,
+              provider?.playlistType == .vod else { return false }
         return !videoOnly.lowercased().hasPrefix("dvh")
     }
 
@@ -1355,7 +1368,12 @@ final class HLSLocalServer: @unchecked Sendable {
         // restore DV to its exact pre-#158 state — no previews, unchanged
         // playback (#158 review I2). SDR (avc1) and DV 8.x (video-only codec
         // is plain hvc1) are unaffected and keep previews.
+        // VOD-gate the I-frame line: v2 previews are sweep-produced and
+        // VOD-only, so a live/EVENT master must not advertise a variant whose
+        // #EXT-X-I-FRAMES-ONLY playlist would 404 (#158 v2). Kept in lockstep
+        // with `advertisesIFrameStream` so the two stay equivalent.
         if let iframeCodecs = provider.masterVideoOnlyCodecs,
+           provider.playlistType == .vod,
            !iframeCodecs.lowercased().hasPrefix("dvh") {
             var iframeAttrs: [String] = []
             iframeAttrs.append("BANDWIDTH=\(provider.masterBandwidth ?? 5_000_000)")
@@ -1562,84 +1580,42 @@ final class HLSLocalServer: @unchecked Sendable {
         return lines.joined(separator: "\n") + "\n"
     }
 
-    /// I-frames-only playlist for trick-play seek previews (#158). Mirrors
-    /// `buildMediaPlaylistText`: same atomic `notePlaylistBuild` snapshot,
-    /// same `firstVisible..<count` window, same init/segment URI scheme —
-    /// but declares `#EXT-X-I-FRAMES-ONLY` and gives every segment a FIXED
-    /// generous byte range at offset 0 in place of a whole-segment entry.
-    ///
-    /// FIXED byte range, not exact per-segment: the playlist lists all N
-    /// segments upfront from the keyframe plan WITHOUT muxing them, so exact
-    /// `#EXT-X-BYTERANGE` lengths don't exist yet — computing them would
-    /// force producing every segment upfront and defeat on-demand muxing.
-    /// Every segment is `moof`+`mdat` starting with its IDR at byte 0, so
-    /// `<LEN>@0` always covers `moof`+IDR. The server clamps the Range to
-    /// the real segment size (206 Content-Range), so an over-estimate is
-    /// safe and a too-small one only truncates a rare huge IDR (that one
-    /// preview is missing — graceful, no crash). LEN is resolution-scaled,
-    /// `max(1 MiB, width*height/2)` (≈1 MiB for ≤1080p, ≈4 MiB at 4K),
-    /// comfortably above one intra-coded keyframe's compressed size at any
-    /// sane bitrate. This needs NO muxer changes.
+    /// I-frames-only playlist for trick-play seek previews (#158 v2).
+    /// Whole-file VOD enumeration of the segment plan — one preview fragment
+    /// URI per segment, one EXT-X-MAP, no byte ranges. Built complete
+    /// upfront: AVKit fetches it once. Only VOD providers ever get here
+    /// (the master's I-frame line is VOD-gated), so no live/EVENT branches.
     static func buildIFramePlaylistText(provider: HLSSegmentProvider,
                                         subResourceBaseURL: URL? = nil) -> String {
-        // Same atomic snapshot discipline as buildMediaPlaylistText: one
-        // notePlaylistBuild() read, then build entirely from it (VOD returns
-        // a static snapshot; live's window advance is idempotent at a fixed
-        // segment total, so a media+iframe pair never double-evicts).
-        let snapshot = provider.notePlaylistBuild()
-        let count = snapshot.visibleCount
-        let firstVisible = min(snapshot.firstVisible, count)
-        let typeIsEvent = (provider.playlistType == .event && !snapshot.endlistAdded)
-        let typeIsLive = (provider.playlistType == .live && !snapshot.endlistAdded)
+        let count = provider.segmentCount
+        var maxDuration = 1.0
+        for i in 0..<count { maxDuration = max(maxDuration, provider.segmentDuration(at: i)) }
 
-        var maxDuration: Double = 0
-        for i in firstVisible..<count {
-            maxDuration = max(maxDuration, provider.segmentDuration(at: i))
-        }
-        let targetDuration = Int(ceil(max(1.0, maxDuration)))
-
-        // Fixed, generous, resolution-scaled byte-range length (see doc
-        // comment). Falls back to the 1 MiB floor when resolution is absent.
-        let byteRangeLength: Int
-        if let resolution = provider.masterResolution {
-            byteRangeLength = max(1_048_576, resolution.width * resolution.height / 2)
+        let initURI: String
+        let fragURI: (Int) -> String
+        if let base = subResourceBaseURL {
+            let baseStr = base.absoluteString
+            let baseWithSlash = baseStr.hasSuffix("/") ? baseStr : baseStr + "/"
+            initURI = "\(baseWithSlash)preview-init.mp4"
+            fragURI = { i in "\(baseWithSlash)preview-\(i).m4s" }
         } else {
-            byteRangeLength = 1_048_576
+            initURI = "preview-init.mp4"
+            fragURI = { i in "preview-\(i).m4s" }
         }
 
         var lines: [String] = []
         lines.append("#EXTM3U")
         lines.append("#EXT-X-VERSION:7")
-        lines.append("#EXT-X-TARGETDURATION:\(targetDuration)")
-        lines.append("#EXT-X-MEDIA-SEQUENCE:\(firstVisible)")
-        if typeIsEvent {
-            lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
-        } else if !typeIsLive {
-            lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
-        }
+        lines.append("#EXT-X-TARGETDURATION:\(Int(ceil(maxDuration)))")
+        lines.append("#EXT-X-MEDIA-SEQUENCE:0")
+        lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
         lines.append("#EXT-X-I-FRAMES-ONLY")
-
-        let initURI: String
-        let segURI: (Int) -> String
-        if let base = subResourceBaseURL {
-            let baseStr = base.absoluteString
-            let baseWithSlash = baseStr.hasSuffix("/") ? baseStr : baseStr + "/"
-            initURI = "\(baseWithSlash)init.mp4"
-            segURI = { idx in "\(baseWithSlash)seg\(idx).mp4" }
-        } else {
-            initURI = "init.mp4"
-            segURI = { idx in "seg\(idx).mp4" }
-        }
         lines.append("#EXT-X-MAP:URI=\"\(initURI)\"")
-        for i in firstVisible..<count {
-            let dur = provider.segmentDuration(at: i)
-            lines.append("#EXTINF:\(String(format: "%.3f", dur)),")
-            lines.append("#EXT-X-BYTERANGE:\(byteRangeLength)@0")
-            lines.append(segURI(i))
+        for i in 0..<count {
+            lines.append("#EXTINF:\(String(format: "%.3f", provider.segmentDuration(at: i))),")
+            lines.append(fragURI(i))
         }
-        if !typeIsLive && (snapshot.endlistAdded || !typeIsEvent) {
-            lines.append("#EXT-X-ENDLIST")
-        }
+        lines.append("#EXT-X-ENDLIST")
         return lines.joined(separator: "\n") + "\n"
     }
 
