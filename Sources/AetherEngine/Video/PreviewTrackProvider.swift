@@ -168,15 +168,18 @@ final class PreviewTrackProvider: PreviewFragmentSource, @unchecked Sendable {
             // The seek lands at/BEFORE the target; the scan-forward gate below
             // advances to the first keyframe at/after the segment start.
             d.seek(to: Double(seg.startPts) * tbSec)
-            // The mp4 fragmented muxer derives each fragment's tfdt
-            // (baseMediaDecodeTime) from the ACCUMULATED sample durations of
-            // prior fragments, not from the packet dts. Stamping the single
-            // keyframe with the segment's own span makes the fragments tile the
-            // timeline: tfdt(seg i) == Σ spans[0..<i] == seg[i].startPts −
-            // seg[0].startPts == seg[i].startPts − firstKeyframePts (the plan is
-            // contiguous). This is also the idiomatic I-frame-playlist encoding
-            // (each I-frame "lasts" until the next) and guarantees a positive
-            // trun.sample_duration even when the source packet reports 0.
+            // Two independent stamps position + size each single-sample moof:
+            //  1. tfdt (baseMediaDecodeTime) is derived by the mp4 fragmenter
+            //     from the packet DTS we set below (dts −= firstKeyframePts,
+            //     then rescale to the muxer timebase). So fragment i lands at
+            //     media time seg[i].startPts − firstKeyframePts — the SAME
+            //     convention the playback producer uses for its segment tfdt, so
+            //     previews and media segments share one timeline (a scrub maps a
+            //     thumbnail to the right playhead position).
+            //  2. the segment span below sets the sample's duration → the
+            //     fragment's declared length (its EXTINF, "lasts until the next
+            //     I-frame") and guarantees a positive trun.sample_duration even
+            //     when the source packet reports 0.
             let spanTicks = seg.endPts - seg.startPts
             let sampleDurationTicks = spanTicks > 0 ? spanTicks : fallbackDurationTicks
             packetLoop: while !isCancelled {
