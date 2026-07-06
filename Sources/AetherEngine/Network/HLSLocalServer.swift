@@ -30,15 +30,6 @@ protocol HLSSegmentProvider: AnyObject {
     /// `sendfile(2)` approach is SIGSYS-blocked by the tvOS sandbox).
     func mediaSegmentURL(at index: Int) -> URL?
 
-    /// Side-effect-free segment-URL lookup for trick-play preview
-    /// (byte-range / I-frame) fetches. Unlike `mediaSegmentURL(at:)` this
-    /// MUST NOT `declareTarget`, extend the visible window, or restart the
-    /// producer, so a preview probe for a far-off segment can never
-    /// retarget the cache away from the play position (#158 review). Returns
-    /// nil when the segment isn't resident — a missing preview is graceful
-    /// (the server answers 404 and AVKit falls back to a time-only scrub).
-    func previewSegmentURL(at index: Int) -> URL?
-
     /// Number of segments currently known. May grow over time for
     /// `.event` playlists, fixed for `.vod` playlists.
     var segmentCount: Int { get }
@@ -196,11 +187,6 @@ extension HLSSegmentProvider {
     /// the file-streaming fast path (no Data materialization).
     func mediaSegmentURL(at index: Int) -> URL? { nil }
 
-    /// Default: no resident file backing (memory-only / non-cache
-    /// providers). A provider with a segment cache overrides this to
-    /// return the cached file URL with no side effects.
-    func previewSegmentURL(at index: Int) -> URL? { nil }
-
     /// Default: append-only / VOD playlists always start at segment 0.
     var firstVisibleSegmentIndex: Int { 0 }
 
@@ -338,6 +324,12 @@ final class HLSLocalServer: @unchecked Sendable {
     /// Provider set via `init(provider:)`. Held weakly; the producer
     /// owns its own lifetime and the server outlives it on teardown.
     private weak var externalProvider: HLSSegmentProvider?
+
+    /// Source of #158 v2 whole-file preview fragments (PreviewCache).
+    /// Set by the engine after start; held weakly like `externalProvider`.
+    /// The `/preview-init.mp4` and `/preview-<i>.m4s` routes read only from
+    /// here — pure PreviewCache reads with no playback-side effects (C1).
+    weak var previewSource: (any PreviewFragmentSource)?
 
     private var provider: HLSSegmentProvider? {
         externalProvider
@@ -931,6 +923,16 @@ final class HLSLocalServer: @unchecked Sendable {
             }
             return send404(fd: fd, path: normalizedPath, reason: "no masterVideoOnlyCodecs")
 
+        case "/preview-init.mp4":
+            // #158 v2 preview init segment: pure PreviewCache read — never
+            // touches SegmentCache, the window, or the producer (C1).
+            if let data = previewSource?.previewInitData() {
+                return send200(fd: fd, path: normalizedPath, data: data,
+                               contentType: "video/mp4")
+            }
+            return send404(fd: fd, path: normalizedPath,
+                           reason: "preview init not captured")
+
         case "/init.mp4":
             let data = provider?.initSegment() ?? Data()
             if data.isEmpty {
@@ -941,6 +943,25 @@ final class HLSLocalServer: @unchecked Sendable {
                            contentType: "video/mp4")
 
         default:
+            if normalizedPath.hasPrefix("/preview-"), normalizedPath.hasSuffix(".m4s") {
+                let indexStr = normalizedPath.dropFirst("/preview-".count).dropLast(4)
+                if let index = Int(indexStr), index >= 0 {
+                    // #158 v2 preview fragment: pure PreviewCache read — never
+                    // touches SegmentCache, the window, or the producer (C1).
+                    // Nearest-available: the source resolves a not-yet-swept
+                    // index to the closest swept fragment (Gate-0(b)-ratified).
+                    if let url = previewSource?.previewFragmentURL(forIndex: index) {
+                        if let rangeHeader {
+                            return send206OrFullFile(fd: fd, path: normalizedPath,
+                                                     fileURL: url, rangeHeader: rangeHeader)
+                        }
+                        return send200File(fd: fd, path: normalizedPath,
+                                           fileURL: url, contentType: "video/mp4")
+                    }
+                    return send404(fd: fd, path: normalizedPath,
+                                   reason: "no preview swept yet")
+                }
+            }
             if normalizedPath.hasPrefix("/seg"),
                normalizedPath.hasSuffix(".mp4") {
                 let indexStr = normalizedPath.dropFirst(4).dropLast(4)
@@ -950,27 +971,10 @@ final class HLSLocalServer: @unchecked Sendable {
                         if seg0FetchTime == nil { seg0FetchTime = Date() }
                         stateLock.unlock()
                     }
-                    // A Range request is a trick-play I-frame byte-range
-                    // extraction (#158), never a sequential playback fetch:
-                    // the media playlist carries no byte ranges, so only
-                    // iframe.m3u8 entries produce Range requests. Serve it
-                    // side-effect-free from a resident cache file via
-                    // `previewSegmentURL` — NO declareTarget / window
-                    // extension / producer restart — so a scrub preview for a
-                    // far-off segment cannot retarget the cache away from the
-                    // play position (#158 review C1). A non-resident preview
-                    // is a graceful 404; it MUST NOT fall through to the
-                    // blocking `mediaSegment(at:)` producer-restart path.
-                    if let rangeHeader {
-                        if let url = provider?.previewSegmentURL(at: index) {
-                            return send206OrFullFile(fd: fd, path: normalizedPath,
-                                                     fileURL: url, rangeHeader: rangeHeader)
-                        }
-                        return send404(fd: fd, path: normalizedPath,
-                                       reason: "preview segment[\(index)] not resident")
-                    }
-                    // Playback (non-Range) path — unchanged. These fetches
-                    // legitimately drive the cache window + producer restart.
+                    // Playback path. Any Range request on a playback segment
+                    // now falls through here too (pre-#158 behavior); the v2
+                    // trick-play previews are served from the dedicated
+                    // /preview-<i>.m4s route above, never off /seg.
                     // Fast path: if the segment is file-backed (cache
                     // adopt path), stream the file directly
                     // from the page cache to the socket — bypasses
