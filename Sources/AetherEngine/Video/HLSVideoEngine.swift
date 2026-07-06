@@ -160,6 +160,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var savedVideoConfig: HLSSegmentProducer.StreamConfig?
     var savedAudioConfig: HLSSegmentProducer.AudioConfig?
 
+    /// #158 v2: background-sweep preview provider. Non-nil only for VOD
+    /// URL-source sessions whose master advertises the I-frame variant.
+    var previewProvider: PreviewTrackProvider?
+
     /// Per-frame fallback durations (in the respective source
     /// time_base) so the producer can backfill `pkt->duration` when
     /// the matroska demuxer doesn't supply per-block durations.
@@ -1443,6 +1447,26 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
         self.servingMasterPlaylist = useMasterPlaylist
         EngineLog.emit("[HLSVideoEngine] serving on \(url.absoluteString) (dvModeAvailable=\(dvModeAvailable) effectiveDvMode=\(effectiveDvMode) panelIsHDR=\(panelIsInHDRMode) displaySupportsHDR=\(displaySupportsHDR) matchContent=\(matchContentEnabled) sourceIsHDR=\(sourceIsHDR) useMaster=\(useMasterPlaylist) videoRange=\(videoRange) dvVariant=\(dvVariant))")
+
+        // #158 v2: background-sweep preview track. Gates: master actually
+        // advertises the I-frame variant (VOD + non-dvh, Task 8), the session
+        // routes AT the master (else AVKit never sees iframe.m3u8), and this
+        // is a real network/file URL source (`sourceReopenableByURL` is false
+        // for custom IOReader-backed sources whose sourceURL is the synthetic
+        // `aether-custom://source` placeholder — those have no second cursor
+        // here, so previews are correctly absent, spec-accepted).
+        if useMasterPlaylist, srv.advertisesIFrameStream, !isLiveSession,
+           sourceReopenableByURL, let cfg = savedVideoConfig, !segmentPlan.isEmpty {
+            let preview = PreviewTrackProvider(
+                sourceURL: sourceURL,
+                httpHeaders: sourceHTTPHeaders,
+                plan: segmentPlan,
+                firstKeyframePts: firstKeyframePts,
+                videoConfig: cfg)
+            previewProvider = preview
+            srv.previewSource = preview
+            preview.start()
+        }
         return url
     }
 
@@ -1679,6 +1703,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
         preopenedDemuxer = nil
         let prov = provider
         provider = nil
+        // #158 v2: the preview provider is playback-decoupled and survives
+        // producer restarts (which keep the server); only a full stop() tears
+        // it down. Snapshot + clear here; shutdown() runs first in the
+        // detached cleanup below.
+        let pv = previewProvider
+        previewProvider = nil
         savedVideoConfig = nil
         savedAudioConfig = nil
         // The owned codecpar copies must outlive the pump's unwind (the
@@ -1725,6 +1755,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // accesses them by reference during the unwind; the closure
         // serialises that ordering off-thread.
         Task.detached {
+            // Prompt: shutdown() flips the cancel flag + markClosed()s the
+            // sweep demuxer, so the background sweep unwinds before the
+            // producer queue drain below rather than racing it.
+            pv?.shutdown()
             _ = p?.waitForFinish(timeout: 3.0)
             s?.stop()
             c?.close()
