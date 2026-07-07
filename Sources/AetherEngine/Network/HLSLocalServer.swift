@@ -948,8 +948,10 @@ final class HLSLocalServer: @unchecked Sendable {
                 if let index = Int(indexStr), index >= 0 {
                     // #158 v2 preview fragment: pure PreviewCache read — never
                     // touches SegmentCache, the window, or the producer (C1).
-                    // Nearest-available: the source resolves a not-yet-swept
-                    // index to the closest swept fragment (Gate-0(b)-ratified).
+                    // Exact-or-404: the source returns a URL only when this
+                    // exact index has been swept; a not-yet-swept (or capped/
+                    // skipped) index returns nil and 404s below. AVKit tolerates
+                    // the 404 and refetches the exact fragment on demand.
                     if let url = previewSource?.previewFragmentURL(forIndex: index) {
                         if let rangeHeader {
                             return send206OrFullFile(fd: fd, path: normalizedPath,

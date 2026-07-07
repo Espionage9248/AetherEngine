@@ -177,7 +177,8 @@ struct PreviewTrackProviderTests {
                                             firstKeyframePts: 0, videoConfig: cfg)
         provider.runSweepSynchronously()
         probe.close()
-        #expect(provider.previewFragmentURL(forIndex: 999) != nil)     // nearest-available
+        #expect(provider.previewFragmentURL(forIndex: 0) != nil)        // exact swept index → url
+        #expect(provider.previewFragmentURL(forIndex: 999) == nil)      // unswept index → 404 (was nearest)
         provider.shutdown()
         #expect(provider.previewFragmentURL(forIndex: 0) == nil)       // dead after shutdown
     }

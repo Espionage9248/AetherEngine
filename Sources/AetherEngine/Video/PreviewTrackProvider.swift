@@ -41,7 +41,7 @@ final class PreviewTrackProvider: PreviewFragmentSource, @unchecked Sendable {
     private var demuxer: Demuxer?
     private var shutDown = false
 
-    /// ~500 MB hard cap (spec): sweep stops, logs, nearest-available covers the tail.
+    /// ~500 MB hard cap (spec): sweep stops and logs; slots past the cap simply 404 (no thumbnail).
     private static let cacheByteCap = 500 * 1024 * 1024
 
     init(sourceURL: URL, httpHeaders: [String: String],
@@ -105,7 +105,7 @@ final class PreviewTrackProvider: PreviewFragmentSource, @unchecked Sendable {
     // MARK: - Serving (pure cache reads — C1)
 
     func previewInitData() -> Data? { cache.initData() }
-    func previewFragmentURL(forIndex index: Int) -> URL? { cache.fileURL(nearestTo: index) }
+    func previewFragmentURL(forIndex index: Int) -> URL? { cache.fileURL(exactly: index) }
 
     // MARK: - Sweep
 
@@ -160,7 +160,7 @@ final class PreviewTrackProvider: PreviewFragmentSource, @unchecked Sendable {
             if isCancelled { break }
             if cache.totalBytes >= Self.cacheByteCap {
                 EngineLog.emit("[PreviewSweep] byte cap reached at seg \(i)/\(plan.count) — " +
-                               "stopping; nearest-available covers the tail", category: .session)
+                               "stopping; slots past the cap will 404 (no thumbnail)", category: .session)
                 break
             }
             // Seek in the SOURCE PTS domain (startPts is a raw stream timestamp;

@@ -78,15 +78,12 @@ final class PreviewCache: @unchecked Sendable {
         }
     }
 
-    /// Exact index, else nearest by |Δindex| (tie → lower). nil when empty/closed.
-    func fileURL(nearestTo index: Int) -> URL? {
+    /// Exact index only. nil when that index is not present (not yet swept, or
+    /// never produced — cap-tail / skipped keyframe), or when empty/closed.
+    func fileURL(exactly index: Int) -> URL? {
         lock.lock(); defer { lock.unlock() }
-        guard !closed, !indices.isEmpty else { return nil }
-        var best = indices[0]
-        for i in indices {
-            if abs(i - index) < abs(best - index) { best = i }
-        }
-        return sessionDir.appendingPathComponent("preview-\(best).m4s")
+        guard !closed, indices.contains(index) else { return nil }
+        return sessionDir.appendingPathComponent("preview-\(index).m4s")
     }
 
     var totalBytes: Int {
