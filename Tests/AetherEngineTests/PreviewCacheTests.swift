@@ -13,21 +13,21 @@ struct PreviewCacheTests {
 
     @Test func adoptAndExactLookup() throws {
         let cache = PreviewCache(); defer { cache.close() }
-        #expect(cache.fileURL(nearestTo: 3) == nil)                    // empty → nil
+        #expect(cache.fileURL(exactly: 3) == nil)                      // empty → nil
         #expect(cache.adopt(stagingPath: try makeStaging(cache), forIndex: 3))
-        let url = cache.fileURL(nearestTo: 3)
+        let url = cache.fileURL(exactly: 3)
         #expect(url?.lastPathComponent == "preview-3.m4s")
         #expect(FileManager.default.fileExists(atPath: url!.path))
     }
 
-    @Test func nearestLookupTieBreaksLow() throws {
+    @Test func unsweptIndexReturnsNil() throws {
         let cache = PreviewCache(); defer { cache.close() }
         _ = cache.adopt(stagingPath: try makeStaging(cache), forIndex: 10)
         _ = cache.adopt(stagingPath: try makeStaging(cache), forIndex: 20)
-        #expect(cache.fileURL(nearestTo: 12)?.lastPathComponent == "preview-10.m4s")
-        #expect(cache.fileURL(nearestTo: 18)?.lastPathComponent == "preview-20.m4s")
-        #expect(cache.fileURL(nearestTo: 15)?.lastPathComponent == "preview-10.m4s") // tie → lower
-        #expect(cache.fileURL(nearestTo: 500)?.lastPathComponent == "preview-20.m4s")
+        #expect(cache.fileURL(exactly: 10)?.lastPathComponent == "preview-10.m4s") // exact hit still works
+        #expect(cache.fileURL(exactly: 15) == nil)   // in-between, not yet swept → nil (was nearest)
+        #expect(cache.fileURL(exactly: 500) == nil)  // past the tail (cap/skip) → nil (was nearest)
+        #expect(cache.fileURL(exactly: 5) == nil)    // before the first present index → nil
     }
 
     @Test func totalBytesAccumulates() throws {
@@ -50,6 +50,6 @@ struct PreviewCacheTests {
         let dir = cache.sessionDir
         cache.close()
         #expect(!FileManager.default.fileExists(atPath: dir.path))
-        #expect(cache.fileURL(nearestTo: 0) == nil)
+        #expect(cache.fileURL(exactly: 0) == nil)
     }
 }
