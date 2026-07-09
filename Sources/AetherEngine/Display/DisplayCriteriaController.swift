@@ -165,7 +165,15 @@ final class DisplayCriteriaController {
             codecType: codecType,
             hasExtensions: extensions != nil
         )
-        if didApply, appliedCriteria == incoming {
+        // The manager must still be holding OUR criteria for the skip
+        // to be sound: AVKit's auto-criteria path can replace or clear
+        // `preferredDisplayCriteria` mid-session (co-writer on the
+        // non-suppressed native path), and a false-skip then would
+        // leave the panel programmed with something else — or nothing.
+        // AVDisplayCriteria exposes no equality surface, so non-nil is
+        // the strongest cheap check.
+        if didApply, appliedCriteria == incoming,
+           displayManager.preferredDisplayCriteria != nil {
             EngineLog.emit(
                 "[DisplayCriteria] unchanged (format=\(format) rate=\(String(format: "%.3f", incoming.rate)) codec=\(fourccString(codecType))); write skipped",
                 category: .engine

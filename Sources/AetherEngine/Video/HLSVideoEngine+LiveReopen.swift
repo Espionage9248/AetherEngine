@@ -11,20 +11,38 @@ extension HLSVideoEngine {
             // driven `restartProducer` recovery presumes a session the
             // player got far enough into to scrub. Surface it so the
             // owner can fail the session and the host's fallback path
-            // takes over (see `onVODEarlyPumpFailure`). Superseded
-            // producers (a restart already replaced this one) stay
-            // silent, as does everything else — mid-session read
-            // errors keep today's behavior (playable buffer + scrub
-            // restart recovery).
-            if case .readError = reason,
-               currentProducerIs(prod),
-               (cache?.count ?? 0) <= 2 {
-                EngineLog.emit(
-                    "[HLSVideoEngine] VOD pump died on a read error before serving "
-                    + "the startup cushion (cache=\(cache?.count ?? 0)); surfacing session failure",
-                    category: .session
-                )
-                onVODEarlyPumpFailure?()
+            // takes over (see `onVODEarlyPumpFailure`).
+            //
+            // Gates: (1) only the session's FIRST producer — a far-seek
+            // relocation prunes the cache so its death would look
+            // identical by cache population alone, but that session
+            // already played and the provider's hole-wait/restart
+            // machinery recovers it; (2) only when the cushion never
+            // landed; (3) only the current producer (a restart-
+            // abandoned pump's late death stays silent). Snapshot
+            // under restartLock per this file's convention: stop()
+            // nils `cache` and restarts bump `producerGeneration`
+            // under the same lock.
+            if case .readError = reason {
+                restartLock.lock()
+                let isCurrent = (producer === prod)
+                let cached = cache?.count ?? 0
+                let generation = producerGeneration
+                restartLock.unlock()
+                if isCurrent, generation == 0, cached <= 2 {
+                    EngineLog.emit(
+                        "[HLSVideoEngine] VOD pump died on a read error before serving "
+                        + "the startup cushion (cache=\(cached)); surfacing session failure",
+                        category: .session
+                    )
+                    // Latch BEFORE the callback: the owning load()
+                    // re-checks the flag around its suspension points
+                    // (the callback's MainActor hop can be dropped by
+                    // the identity guard or clobbered by a late
+                    // `state = .playing`).
+                    markPumpFailedEarly()
+                    onVODEarlyPumpFailure?()
+                }
             }
             return
         }

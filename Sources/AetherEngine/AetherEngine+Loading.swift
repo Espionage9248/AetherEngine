@@ -316,6 +316,16 @@ extension AetherEngine {
             try checkLoadCurrent(generation)
         }
         self.nativeVideoSession = session
+        // The pump can die on a source read error while start() was
+        // detached (the failure callback ran before the session was
+        // installed, so its identity guard dropped it — the latched
+        // flag is the durable record). Fail the load like any other
+        // open failure instead of proceeding to .playing on a dead
+        // pipeline.
+        if session.pumpFailedEarly {
+            throw HLSVideoEngine.HLSVideoEngineError.openFailed(
+                reason: "source read failed before playback could start")
+        }
 
         // Reuse the existing native host across a native->native reload
         // (episode change, audio-track switch) so the AVPlayer instance,
@@ -956,6 +966,14 @@ extension AetherEngine {
                 nativeHost?.play()
             }
             try checkLoadCurrent(gen)
+            // Same dead-pipeline guard as the initial load path: the
+            // pump can die during the handshake wait above, and writing
+            // .playing would clobber the failure callback's .error (see
+            // HLSVideoEngine.pumpFailedEarly).
+            if let session = nativeVideoSession, session.pumpFailedEarly {
+                throw HLSVideoEngine.HLSVideoEngineError.openFailed(
+                    reason: "source read failed before playback could start")
+            }
             state = .playing
             // Re-arm the diagnostic samplers. stopInternal nilled the
             // sampler instance + diagnostics.liveTelemetry, and the

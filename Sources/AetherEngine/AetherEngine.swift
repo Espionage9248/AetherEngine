@@ -1351,6 +1351,17 @@ public final class AetherEngine: ObservableObject {
                 // playback land.
                 await displayCriteria.waitForSwitch()
                 try checkLoadCurrent(gen)
+                // The pump can die on a source read error during the
+                // handshake wait above; the failure callback's MainActor
+                // hop may already have published .error, and writing
+                // .playing over it would leave a dead pipeline labelled
+                // healthy. The latched flag is ordering-safe: set on the
+                // pump thread before the callback fires (see
+                // HLSVideoEngine.pumpFailedEarly).
+                if let session = nativeVideoSession, session.pumpFailedEarly {
+                    throw HLSVideoEngine.HLSVideoEngineError.openFailed(
+                        reason: "source read failed before playback could start")
+                }
                 // Auto-play after load. AVPlayer's
                 // `automaticallyWaitsToMinimizeStalling = true` (default)
                 // handles "play before ready" correctly: it transitions

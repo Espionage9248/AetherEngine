@@ -327,6 +327,35 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// 5 s producer wait or a network-bound demuxer seek.
     let restartLock = NSLock()
 
+    /// How many times `restartProducer` has replaced the session's
+    /// producer (0 = the initial producer from `start()`). Guarded by
+    /// `restartLock`. Read by the VOD early-failure gate so a post-
+    /// scrub relocation death is never mistaken for a cold start (a
+    /// far-seek `declareTarget` prunes the cache, making the two look
+    /// identical by cache population alone).
+    var producerGeneration = 0
+
+    /// Latched (on the pump thread) when a VOD pump died on a source
+    /// read error before serving the startup cushion, BEFORE
+    /// `onVODEarlyPumpFailure` fires. The owning load re-checks this
+    /// flag around its own suspension points: the failure callback's
+    /// MainActor hop can land while `load()` is still mid-flight — the
+    /// session not yet installed (identity guard drops the callback) or
+    /// the load's later `state = .playing` write clobbering the error —
+    /// so the flag, not the callback, is the durable record.
+    private let earlyFailureLock = NSLock()
+    private var _pumpFailedEarly = false
+    var pumpFailedEarly: Bool {
+        earlyFailureLock.lock()
+        defer { earlyFailureLock.unlock() }
+        return _pumpFailedEarly
+    }
+    func markPumpFailedEarly() {
+        earlyFailureLock.lock()
+        _pumpFailedEarly = true
+        earlyFailureLock.unlock()
+    }
+
     /// Serializes restart requests among themselves so multiple AVPlayer
     /// GETs racing the same scrub can't tear down and rebuild the
     /// producer in parallel. Deliberately separate from `restartLock`:
@@ -2121,6 +2150,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         do {
             let newProd = try makeProducer(baseIndex: idx)
             producer = newProd
+            // Relocation producers are generation >= 1: the VOD
+            // early-failure gate only fires for the session's FIRST
+            // producer, never for a post-seek relocation.
+            producerGeneration += 1
             restartLock.unlock()
             newProd.start()
         } catch {
