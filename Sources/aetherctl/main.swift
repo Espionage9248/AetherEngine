@@ -274,7 +274,7 @@ if first == "live" {
 }
 
 // Subcommand path: explicit subcommand + flags + url.
-if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].contains(first) {
+if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio", "switchrepro"].contains(first) {
     var rest = Array(args.dropFirst(2))
     let noDV = takeFlag("--no-dv", from: &rest)
     let framesOverride = takeIntFlag("--frames", from: &rest)
@@ -318,6 +318,14 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
         ))
     case "audio":
         exit(runAudio(url: url, seconds: audioSeconds))
+    case "switchrepro":
+        // #187 diagnosis harness: second positional arg is source B;
+        // --seconds reuses the audio dwell flag for the A-session dwell.
+        guard rest.count >= 2 else {
+            print("ERROR: switchrepro requires <urlA> <urlB>")
+            exit(64)
+        }
+        runSwitchRepro(urlA: url, urlB: parseSourceURL(rest[1]), dwellSeconds: audioSeconds)
     case "customio":
         // urlArg is a filesystem path, not a URL; use rest.first directly.
         exit(runCustomIO(path: urlArg, inMemory: inMemory, forwardOnly: forwardOnly, audioOnly: audioOnlyFlag, reload: reloadFlag, switchAudio: switchAudioFlag, selectSubs: selectSubsFlag, extract: extractFlag))
