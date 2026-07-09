@@ -785,7 +785,16 @@ public final class AetherEngine: ObservableObject {
         // If this source instead routes to the software path, the SW branch
         // in the dispatch below releases the preserved host.
         let priorBackendWasNative = (playbackBackend == .native)
-        stopInternal(keepNativeHost: priorBackendWasNative)
+        // Source-switch reloads keep the panel's criteria through the
+        // teardown so the incoming session's handshake never races a
+        // release-triggered renegotiation (see
+        // `LoadOptions.preserveDisplayCriteria`). The apply below still
+        // programs the NEW source's criteria; only the intermediate
+        // release is skipped.
+        stopInternal(
+            resetDisplayCriteria: !options.preserveDisplayCriteria,
+            keepNativeHost: priorBackendWasNative
+        )
         // This load owns the engine as long as no newer stop/load bumps
         // the generation; every suspension point below re-checks.
         let gen = loadGeneration

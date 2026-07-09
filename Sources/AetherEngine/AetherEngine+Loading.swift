@@ -884,7 +884,22 @@ extension AetherEngine {
                     audioSourceStreamIndex: audioStreamIndex,
                     keepDvh1TagWithoutDV: loadedOptions.keepDvh1TagWithoutDV,
                     matchContentEnabled: loadedOptions.matchContentEnabled,
-                    panelIsInHDRMode: loadedOptions.panelIsInHDRMode,
+                    // Empirical panel read, not the host's pre-load
+                    // LoadOptions snapshot. The criteria survived this
+                    // reload's teardown (resetDisplayCriteria: false), so a
+                    // panel that entered HDR for the initial session still
+                    // reads HDR here — the rebuilt session keeps routing at
+                    // the master playlist (I-frame previews, #187's audio-
+                    // switch leg). The stale snapshot defaulted false for
+                    // hosts that never set it, silently demoting every
+                    // audio switch of an HDR session to media.m3u8.
+                    // Suppressed-criteria hosts keep their snapshot: the
+                    // engine never wrote criteria, so the empirical read
+                    // isn't the engine's to trust (mirrors load()'s
+                    // panelHDRAfterHandshake gating).
+                    panelIsInHDRMode: loadedOptions.suppressDisplayCriteria
+                        ? loadedOptions.panelIsInHDRMode
+                        : displayCriteria.currentPanelIsHDR(),
                     audioBridgeMode: loadedOptions.audioBridgeMode,
                     // Without these the audio-switch reload of a LIVE session
                     // rebuilt the pipeline as VOD: the demuxer opened in

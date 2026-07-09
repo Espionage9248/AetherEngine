@@ -46,6 +46,24 @@ final class DisplayCriteriaController {
     /// panel's locked DV value to 1.0).
     private var didApply: Bool = false
 
+    /// The parameters of the criteria currently programmed on the
+    /// panel (valid only while `didApply`). A repeat `apply` with the
+    /// same parameters skips the `preferredDisplayCriteria` write:
+    /// criteria-preserving source-switch reloads (`LoadOptions.
+    /// preserveDisplayCriteria`) re-apply for the incoming source, and
+    /// when its format/rate match the outgoing one the panel must not
+    /// be offered a fresh negotiation to flap on. `format` captures
+    /// the transfer function (HLG vs PQ), `rate` the snapped refresh
+    /// rate, `codecType` the 4CC (hvc1/dvh1), `hasExtensions` the
+    /// BT.2020 color-extension attachment.
+    private struct AppliedCriteria: Equatable {
+        let format: VideoFormat
+        let rate: Float
+        let codecType: CMVideoCodecType
+        let hasExtensions: Bool
+    }
+    private var appliedCriteria: AppliedCriteria?
+
     init() {}
 
     /// Apply display criteria for the next playback session.
@@ -134,6 +152,27 @@ final class DisplayCriteriaController {
         let dvh1: FourCharCode = 0x64766831
         let codecType: CMVideoCodecType = codecTag ?? (format == .dolbyVision ? dvh1 : kCMVideoCodecType_HEVC)
 
+        // Idempotence: a repeat apply with parameters identical to the
+        // criteria already programmed (criteria-preserving source-switch
+        // reload of a same-format/rate source) must not rewrite
+        // `preferredDisplayCriteria` — even an identical write can offer
+        // the panel a fresh negotiation to flap on. Skipping also skips
+        // the caller's `waitForSwitch`, which is correct: no switch was
+        // initiated and the panel is already in the target mode.
+        let incoming = AppliedCriteria(
+            format: format,
+            rate: Float(frameRate ?? 24.0),
+            codecType: codecType,
+            hasExtensions: extensions != nil
+        )
+        if didApply, appliedCriteria == incoming {
+            EngineLog.emit(
+                "[DisplayCriteria] unchanged (format=\(format) rate=\(String(format: "%.3f", incoming.rate)) codec=\(fourccString(codecType))); write skipped",
+                category: .engine
+            )
+            return false
+        }
+
         var formatDesc: CMVideoFormatDescription?
         CMVideoFormatDescriptionCreate(
             allocator: kCFAllocatorDefault,
@@ -158,6 +197,7 @@ final class DisplayCriteriaController {
         let criteria = AVDisplayCriteria(refreshRate: effectiveRate, formatDescription: desc)
         displayManager.preferredDisplayCriteria = criteria
         didApply = true
+        appliedCriteria = incoming
 
         EngineLog.emit(
             "[DisplayCriteria] SET: format=\(format) codec=\(fourccString(codecType)) "
@@ -298,6 +338,7 @@ final class DisplayCriteriaController {
     func reset() {
         #if os(tvOS)
         guard didApply else { return }
+        appliedCriteria = nil
         guard let window = resolveWindow() else {
             didApply = false
             return

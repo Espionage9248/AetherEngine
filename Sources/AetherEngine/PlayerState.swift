@@ -218,6 +218,25 @@ public struct LoadOptions: Sendable, Equatable {
     /// bitmap tracks are untouched. Default `false` (AetherEngine#30).
     public var preserveASSMarkup: Bool
 
+    /// Keep the panel's active display criteria through this load's
+    /// entry teardown (a source-switch reload: episode change, next-up
+    /// advance on the same engine instance). The default teardown
+    /// releases `AVDisplayManager.preferredDisplayCriteria`, which
+    /// starts a panel-mode negotiation that races the incoming
+    /// session's own criteria handshake: the post-handshake HDR read
+    /// can catch the panel mid-flap and report SDR, demoting an HDR
+    /// source to the media playlist — no I-frame trick-play stream, so
+    /// AVKit's transport-bar seek previews are structurally absent for
+    /// that session (and the double HDMI re-sync adds avoidable black).
+    ///
+    /// With this flag the criteria survive the teardown; the incoming
+    /// load still probes the new source and applies criteria for ITS
+    /// format/rate. An identical criteria is skipped idempotently (no
+    /// negotiation starts); a different one runs the normal handshake.
+    /// The final `stop()` still resets the panel. Default `false`
+    /// (cold loads reset as before).
+    public var preserveDisplayCriteria: Bool
+
     /// ENGINE-INTERNAL: marks this load as a live REJOIN (a reload of
     /// an already-running live session: background-return reopen via
     /// `reloadAtCurrentPosition`). Not part of the public API and not
@@ -247,7 +266,8 @@ public struct LoadOptions: Sendable, Equatable {
         audioOnly: Bool = false,
         dvrWindowSeconds: Double? = nil,
         nativeRemoteHLS: Bool = false,
-        preserveASSMarkup: Bool = false
+        preserveASSMarkup: Bool = false,
+        preserveDisplayCriteria: Bool = false
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -261,6 +281,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.dvrWindowSeconds = dvrWindowSeconds
         self.nativeRemoteHLS = nativeRemoteHLS
         self.preserveASSMarkup = preserveASSMarkup
+        self.preserveDisplayCriteria = preserveDisplayCriteria
     }
 }
 
