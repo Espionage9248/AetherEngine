@@ -4,7 +4,30 @@ extension HLSVideoEngine {
 
     func handlePumpFinished(_ prod: HLSSegmentProducer,
                                     reason: HLSSegmentProducer.PumpExitReason) {
-        guard isLiveSession else { return }
+        guard isLiveSession else {
+            // VOD: a pump that dies on a source read error before the
+            // startup cushion ever reached the cache leaves AVPlayer
+            // starving on the loopback playlist forever — the scrub-
+            // driven `restartProducer` recovery presumes a session the
+            // player got far enough into to scrub. Surface it so the
+            // owner can fail the session and the host's fallback path
+            // takes over (see `onVODEarlyPumpFailure`). Superseded
+            // producers (a restart already replaced this one) stay
+            // silent, as does everything else — mid-session read
+            // errors keep today's behavior (playable buffer + scrub
+            // restart recovery).
+            if case .readError = reason,
+               currentProducerIs(prod),
+               (cache?.count ?? 0) <= 2 {
+                EngineLog.emit(
+                    "[HLSVideoEngine] VOD pump died on a read error before serving "
+                    + "the startup cushion (cache=\(cache?.count ?? 0)); surfacing session failure",
+                    category: .session
+                )
+                onVODEarlyPumpFailure?()
+            }
+            return
+        }
         switch reason {
         case .stopRequested, .muxerFailed:
             return

@@ -104,7 +104,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     private let audioSourceStreamIndexOverride: Int32?
 
     var demuxer: Demuxer?
-    private var cache: SegmentCache?
+    // Read from HLSVideoEngine+LiveReopen's VOD early-failure gate;
+    // writes stay confined to this file.
+    private(set) var cache: SegmentCache?
     var producer: HLSSegmentProducer?
     private var server: HLSLocalServer?
     var provider: VideoSegmentProvider?
@@ -296,6 +298,19 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// a fresh playback session (new transcode at the live edge) and
     /// reload. Fires at most once per producer generation.
     var onLiveSourceReset: (@Sendable () -> Void)?
+    /// Fires when a VOD session's pump dies on a source read error
+    /// before the startup cushion was ever served (AVPlayer has at most
+    /// init + a segment or two and will starve into an indefinite
+    /// stall; nothing else recovers a VOD pump that AVPlayer never got
+    /// far enough to scrub). The owner surfaces it as a session error
+    /// so the host's fallback path takes over. Never fires on a
+    /// requested stop (the producer remaps teardown-window read errors
+    /// to `.stopRequested`) and never fires for live sessions (they
+    /// have their own reopen machinery). Device trace (#187 host
+    /// issue): an episode-change reload's second session read corrupt
+    /// source bytes ~1.8 MB in, the pump exited `readError(-1)` after
+    /// seg-0, and the player sat on the poster indefinitely.
+    var onVODEarlyPumpFailure: (@Sendable () -> Void)?
     /// Session-long FLAC bridge for codecs that aren't legal in fMP4.
     /// Owned by the engine (not the producer) so that producer
     /// restarts on scrub don't lose the bridge's encoder state. The
@@ -1400,7 +1415,22 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // DV side data, so the master-side codec filter accepts them
         // and the standard `sourceIsHDR && panelReadyForHDR` check
         // below routes them correctly.
-        let sourceIsHDR = videoRange != .sdr || effectiveDvMode
+        // Source truth, not panel capability. This previously OR'd in
+        // `effectiveDvMode` (a pure panel/host property), which dragged
+        // every SDR source on a DV-capable system into the panel-gated
+        // branch below — and `panelIsInHDRMode` is an empirical
+        // post-handshake read that can catch the panel mid-negotiation
+        // (device 2/2 repro on an episode-change reload whose frame
+        // rate differed: the rate-only criteria write kicked off a
+        // renegotiation, the read returned false, and a plain SDR
+        // source was demoted to media.m3u8 — previews structurally
+        // absent, #187 host issue). A true SDR source emits an SDR
+        // master (VIDEO-RANGE=SDR, non-DV CODECS) that is safe on
+        // every panel and identical to what the SDR branch serves, so
+        // route it there deterministically. DV-bitstream sources (any
+        // profile) stay here: their master carries DV/PQ attributes
+        // that do need the panel-mode gate.
+        let sourceIsHDR = videoRange != .sdr || dvVariant != .none
         // `panelIsInHDRMode` is authoritative here. AetherEngine.load reads
         // `UIScreen.currentEDRHeadroom` AFTER `DisplayCriteriaController.
         // waitForSwitch` settles and passes the empirical result down, so a

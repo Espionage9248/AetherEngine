@@ -2483,13 +2483,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
             )
         }
 
-        // A muxer-failure break during a stop()-initiated backpressure
-        // wait is teardown, not an error; report it as such.
-        if case .muxerFailed = exitReason {
+        // A muxer failure (stop()-initiated backpressure break) or a
+        // read error (markClosed() yanking a blocked demuxer read)
+        // during a requested stop is teardown, not an error; report it
+        // as such so downstream failure handling never fires on a
+        // normal teardown.
+        switch exitReason {
+        case .muxerFailed, .readError:
             stateLock.lock()
             let stopped = shouldStop
             stateLock.unlock()
             if stopped { exitReason = .stopRequested }
+        default:
+            break
         }
 
         // Dual-source sessions: drop any unconsumed merge lookaheads

@@ -284,6 +284,22 @@ extension AetherEngine {
                 self.liveSourceReset.send()
             }
         }
+        session.onVODEarlyPumpFailure = { [weak self, weak session] in
+            Task { @MainActor in
+                // Identity-guarded like onLiveSourceReset: a superseded
+                // session's late pump death must not fail its successor.
+                guard let self, let session,
+                      self.nativeVideoSession === session else { return }
+                EngineLog.emit(
+                    "[AetherEngine] VOD session failed before startup cushion; publishing error state",
+                    category: .engine
+                )
+                // Same host-visible failure surface as a failed reload:
+                // hosts watch `$state` and run their fallback path. The
+                // pipeline is left for the next load/stop to tear down.
+                self.state = .error("Source read failed before playback could start")
+            }
+        }
         // AVPlayer HLS playback over the loopback HTTP server. Detach
         // the synchronous network I/O inside `session.start()` (opens
         // its own Demuxer + prewarm seek = another ~1-3 s on slow CDN)
