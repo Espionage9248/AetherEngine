@@ -61,4 +61,19 @@ struct LoadOptionsTests {
         #expect(audio.audioOnly == true)
         #expect(video != audio)
     }
+
+    @Test("preserveDisplayCriteria defaults to false")
+    func preserveDisplayCriteriaDefaultsFalse() {
+        // Cold loads reset the panel's criteria; only source-switch
+        // reloads opt in (AetherEngine#187).
+        #expect(LoadOptions().preserveDisplayCriteria == false)
+    }
+
+    @Test("preserveDisplayCriteria is preserved through init and affects equality")
+    func preserveDisplayCriteriaPreservedAndEquatable() {
+        let cold = LoadOptions(preserveDisplayCriteria: false)
+        let preserving = LoadOptions(preserveDisplayCriteria: true)
+        #expect(preserving.preserveDisplayCriteria == true)
+        #expect(cold != preserving)
+    }
 }

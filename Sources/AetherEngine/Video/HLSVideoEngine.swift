@@ -1447,27 +1447,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // panel stayed SDR, AVPlayer rejected with -11848 / -11868 (DrHurt
         // #4 2026-05-27).
         let panelReadyForHDR = panelIsInHDRMode
-        let dv5OnNonDVPanel = dvVariant == .profile5 && !effectiveDvMode
-        let useMasterPlaylist: Bool
-        if dv5OnNonDVPanel {
-            // DV Profile 5 on a non-DV panel MUST route via media.m3u8: the
-            // dvh1 master trips AVPlayer's strict master-level codec filter.
-            useMasterPlaylist = false
-        } else if sourceIsHDR {
-            // HDR / DV with a ready panel routes at the master (VIDEO-RANGE=PQ
-            // and the DV attributes live there); a not-ready panel stays on
-            // media so AVPlayer never matches a PQ master against an SDR-locked
-            // panel (-11848 / -11868). Unchanged behavior.
-            useMasterPlaylist = panelReadyForHDR
-        } else {
-            // SDR: route at the master to expose the I-frame trick-play stream
-            // it advertises for transport-bar seek-preview thumbnails (#158). A
-            // plain SDR avc1/hvc1 master carries VIDEO-RANGE=SDR and a non-DV
-            // primary CODECS, so it does not trip the dvh1 master-refetch path
-            // that originally forced SDR onto media.m3u8. Falls back to media
-            // when no I-frame stream is advertised.
-            useMasterPlaylist = srv.advertisesIFrameStream
-        }
+        // The master-vs-media decision lives in `routesAtMasterPlaylist`
+        // (pure, table-testable). `sourceIsHDR` above mirrors that
+        // helper's HDR test and is retained for the diagnostic log below.
+        let useMasterPlaylist = HLSVideoEngine.routesAtMasterPlaylist(
+            videoRange: videoRange,
+            dvVariant: dvVariant,
+            effectiveDvMode: effectiveDvMode,
+            panelReadyForHDR: panelReadyForHDR,
+            advertisesIFrameStream: srv.advertisesIFrameStream
+        )
         let resolvedURL: URL? = useMasterPlaylist
             ? srv.playlistURL
             : srv.mediaPlaylistURL
@@ -1498,6 +1487,47 @@ public final class HLSVideoEngine: @unchecked Sendable {
             preview.start()
         }
         return url
+    }
+
+    /// Pure master-vs-media playlist routing decision, extracted from
+    /// `start()` so it is table-testable. Reproduces the routing
+    /// contract exactly; `true` means serve the master playlist.
+    ///
+    /// 1. DV Profile 5 on a non-DV panel (`!effectiveDvMode`) MUST route
+    ///    via media.m3u8: the dvh1 master trips AVPlayer's strict
+    ///    master-level codec filter. (Plain HEVC base never exists for
+    ///    P5 — the IPT-PQ-c2 elementary stream is all the source
+    ///    carries — and AVPlayer's media-playlist tonemap path via the
+    ///    dvh1 sample entry in init.mp4 handles the DV-to-display
+    ///    downgrade internally.)
+    /// 2. HDR / DV source (`videoRange != .sdr || dvVariant != .none`,
+    ///    i.e. `sourceIsHDR`): routes at the master only when the panel
+    ///    is ready for HDR (VIDEO-RANGE=PQ and the DV attributes live at
+    ///    the master); a not-ready panel stays on media so AVPlayer
+    ///    never matches a PQ master against an SDR-locked panel (-11848
+    ///    / -11868). Unchanged behavior.
+    /// 3. SDR source: routes at the master to expose the I-frame
+    ///    trick-play stream it advertises for transport-bar seek-preview
+    ///    thumbnails (#158). A plain SDR avc1/hvc1 master carries
+    ///    VIDEO-RANGE=SDR and a non-DV primary CODECS, so it does not
+    ///    trip the dvh1 master-refetch path that originally forced SDR
+    ///    onto media.m3u8. Falls back to media when no I-frame stream is
+    ///    advertised.
+    static func routesAtMasterPlaylist(
+        videoRange: HLSVideoRange,
+        dvVariant: DVVariant,
+        effectiveDvMode: Bool,
+        panelReadyForHDR: Bool,
+        advertisesIFrameStream: Bool
+    ) -> Bool {
+        let dv5OnNonDVPanel = dvVariant == .profile5 && !effectiveDvMode
+        if dv5OnNonDVPanel {
+            return false
+        } else if videoRange != .sdr || dvVariant != .none {
+            return panelReadyForHDR
+        } else {
+            return advertisesIFrameStream
+        }
     }
 
     /// Resolved routing decision exposed for the host's AVPlayerItem
